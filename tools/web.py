@@ -68,13 +68,8 @@ def _strip_html(html: str) -> str:
 
 
 def web_check() -> bool:
-    """检查网络是否可用"""
-    try:
-        import socket
-        socket.create_connection(("8.8.8.8", 53), timeout=2)
-        return True
-    except OSError:
-        return False
+    """Web 工具可注册；实际网络错误由请求时返回。"""
+    return True
 
 
 # 注册 web_request 工具（async handler，Agent 循环中通过 dispatch_async 调用）

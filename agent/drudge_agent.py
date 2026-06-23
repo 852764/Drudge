@@ -6,10 +6,10 @@ import asyncio
 from typing import Any
 
 from .llm import LLMClient, create_client
-from .tools import registry
-from .prompt import build_system_prompt
-from .config import get_config, ConfigManager
-from .utils import truncate_string
+from tools import registry
+from prompt import build_system_prompt
+from config import get_config, ConfigManager
+from utils import truncate_string
 
 # 工具调用结果的最大字符数
 MAX_TOOL_RESULT_CHARS = 10000
