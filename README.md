@@ -53,3 +53,12 @@ drudge -c config.yaml -m gpt-4o-mini
 python main.py --version
 python main.py --help
 ```
+## todo
+```
+1.先修改agent，如果出现 我不能帮你之类的 就调用另外的 修改返回
+2.修改配置文件，辅助的用便宜的
+3.增加mcp的适配
+4.增加一些tools和skills
+5.压缩以及选择加载tools和skills的配置，以及tools skills 的分类管理
+
+```
