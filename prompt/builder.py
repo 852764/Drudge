@@ -36,7 +36,7 @@ def build_system_prompt(
 
 
 def _agent_identity() -> str:
-    return """You are Hermes Lite, a CLI AI Agent running on the user's computer.
+    return """You are Drudge , a CLI AI Agent running on the user's computer.
 Your job is to help the user accomplish tasks by using tools to interact with their system.
 
 Key principles:
