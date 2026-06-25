@@ -20,7 +20,7 @@ async def web_request_handler(
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             req_headers = headers or {}
-            req_headers.setdefault("User-Agent", "Hermes-Lite/0.1")
+            req_headers.setdefault("User-Agent", "Drudge-Lite/0.1")
 
             if method.upper() == "GET":
                 response = await client.get(url, headers=req_headers)

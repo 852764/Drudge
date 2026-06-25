@@ -6,6 +6,8 @@ import asyncio
 from typing import Any
 
 from .llm import LLMClient, create_client
+from .refusal import build_refusal_review_messages, is_refusal
+from .storage import ConversationStore
 from tools import registry
 from prompt import build_system_prompt
 from config import get_config, ConfigManager
@@ -21,15 +23,39 @@ class Agent:
     def __init__(self, config: ConfigManager | None = None):
         self.config = config or get_config()
         self.llm: LLMClient | None = None
+        self.refusal_llm: LLMClient | None = None
         self._messages: list[dict] = []
         self._turn_count: int = 0
         self._total_tokens: int = 0
+        self.session_id: str | None = None
+        self.store: ConversationStore | None = None
+        self._init_store()
+
+    def _init_store(self) -> None:
+        storage_config = self.config.get_storage_config()
+        if not storage_config.get("enabled", True):
+            return
+        self.store = ConversationStore(storage_config.get("path", "~/.drudge/drudge.db"))
 
     def _init_llm(self) -> None:
         """初始化 LLM 客户端"""
         if self.llm is None:
             mc = self.config.get_model_config()
             self.llm = create_client(mc)
+        security = self.config.get_security_config()
+        registry.set_runtime_defaults({
+            "workspace": security.get("workspace_root", os.getcwd()),
+            "allow_outside_workspace": security.get("allow_outside_workspace", False),
+            "allow_terminal": security.get("allow_terminal", True),
+        })
+
+    def _init_refusal_llm(self) -> None:
+        if self.refusal_llm is None:
+            mc = dict(self.config.get_model_config())
+            review_config = self.config.get("agent", "refusal_review_model", default=None)
+            if isinstance(review_config, dict):
+                mc.update(review_config)
+            self.refusal_llm = create_client(mc)
 
     def _build_initial_messages(
         self,
@@ -45,6 +71,65 @@ class Agent:
             {"role": "system", "content": system_content},
             {"role": "user", "content": user_prompt},
         ]
+
+    def _ensure_session(self, prompt: str, memory_entries: list[str] | None, skills: list[str] | None) -> None:
+        if self._messages:
+            self._messages.append({"role": "user", "content": prompt})
+            self._persist_message("user", prompt)
+            return
+
+        self._messages = self._build_initial_messages(prompt, memory_entries, skills)
+        if not self.store:
+            return
+
+        model = self.config.get("model", "name", default="unknown")
+        self.session_id = self.store.create_session(prompt, model)
+        for message in self._messages:
+            self._persist_message(message["role"], message.get("content"))
+
+    def _persist_message(
+        self,
+        role: str,
+        content: str | None,
+        *,
+        tool_call_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self.store and self.session_id:
+            self.store.append_message(
+                self.session_id,
+                role,
+                content,
+                tool_call_id=tool_call_id,
+                metadata=metadata,
+            )
+
+    def _persist_tool_call(self, name: str, args: dict, result: str) -> None:
+        if self.store and self.session_id:
+            self.store.append_tool_call(self.session_id, self._turn_count, name, args, result)
+
+    async def _review_refusal_if_needed(self, user_prompt: str, response_text: str) -> str:
+        agent_config = self.config.get_agent_config()
+        if not agent_config.get("refusal_review_enabled", True):
+            return response_text
+        if not is_refusal(response_text):
+            return response_text
+
+        notice = agent_config.get(
+            "refusal_review_notice",
+            "[Drudge] Detected a possible refusal. Running a safe second-pass review...",
+        )
+        self._persist_message("system", notice, metadata={"event": "refusal_review_started"})
+
+        self._init_refusal_llm()
+        review_messages = build_refusal_review_messages(user_prompt, response_text)
+        review_response = await self.refusal_llm.chat(review_messages)
+        usage = review_response.get("usage", {})
+        self._total_tokens += usage.get("total_tokens", 0)
+        review_text = self.refusal_llm.extract_text(review_response) or response_text
+        self._messages.append({"role": "assistant", "content": review_text})
+        self._persist_message("assistant", review_text, metadata={"refusal_review": True})
+        return f"{notice}\n\n{review_text}"
 
     async def run(
         self,
@@ -66,8 +151,7 @@ class Agent:
             最终响应文本
         """
         self._init_llm()
-        self._turn_count = 0
-        self._messages = self._build_initial_messages(prompt, memory_entries, skills)
+        self._ensure_session(prompt, memory_entries, skills)
 
         max_turns = self.config.get_agent_config().get("max_turns", 50)
         compression_threshold = self.config.get_agent_config().get("compression_threshold", 0.80)
@@ -76,7 +160,10 @@ class Agent:
 
         final_response_parts: list[str] = []
 
-        while self._turn_count < max_turns:
+        request_turns = 0
+        hit_max_turns = True
+        while request_turns < max_turns:
+            request_turns += 1
             self._turn_count += 1
 
             # 上下文压缩检查
@@ -107,6 +194,9 @@ class Agent:
                 final_response_parts.append(text)
                 # 如果 LLM 决定停止且不是 tool_call，返回
                 if finish_reason == "stop":
+                    self._messages.append({"role": "assistant", "content": text})
+                    self._persist_message("assistant", text)
+                    hit_max_turns = False
                     break
 
             # 处理工具调用
@@ -118,6 +208,7 @@ class Agent:
                     "tool_calls": tool_calls,
                 }
                 self._messages.append(assistant_msg)
+                self._persist_message("assistant", text, metadata={"tool_calls": tool_calls})
 
                 for tc in tool_calls:
                     func = tc.get("function", {})
@@ -139,6 +230,8 @@ class Agent:
                         "content": tool_result,
                     }
                     self._messages.append(tool_msg)
+                    self._persist_message("tool", tool_result, tool_call_id=tc.get("id", ""))
+                    self._persist_tool_call(tool_name, tool_args, tool_result)
 
                     # 日志（如果配置开启了）
                     if self.config.get("display", "show_tool_calls"):
@@ -150,18 +243,21 @@ class Agent:
             # 无工具调用且 finish_reason 不是 stop — 将助手消息加入历史
             if text:
                 self._messages.append({"role": "assistant", "content": text})
+                self._persist_message("assistant", text)
 
             # 如果 finish_reason 是 stop 或 length，退出
             if finish_reason in ("stop", "length"):
+                hit_max_turns = False
                 break
 
         # 达到 max_turns
-        if self._turn_count >= max_turns:
+        if hit_max_turns:
             final_response_parts.append(
                 f"\n\n[Agent reached maximum turns ({max_turns}). Task may be incomplete.]"
             )
 
-        return "\n".join(final_response_parts)
+        final_text = "\n".join(final_response_parts)
+        return await self._review_refusal_if_needed(prompt, final_text)
 
     def _compress_context(self) -> None:
         """压缩上下文：保留系统消息 + 最近 N 轮 + 会话摘要"""

@@ -1,6 +1,6 @@
 # Drudge
 
-Drudge 是一个轻量级终端 AI Agent 原型，目标是逐步演进成类似 Hermes / Codex 的本地开发助手。
+Drudge 是一个轻量级终端 AI Agent 原型，目标是逐步演进成类似 Drudge / Codex 的本地开发助手。
 
 ## 当前能力
 
@@ -36,6 +36,13 @@ toolsets:
   - terminal
   - file
   - web
+
+agent:
+  refusal_review_enabled: true
+  refusal_review_notice: "[Drudge] 检测到模型可能拒绝了请求，正在进行安全二次处理..."
+  # Optional: override the second-pass review model/provider.
+  # refusal_review_model:
+  #   name: gpt-4o-mini
 ```
 
 ## 使用

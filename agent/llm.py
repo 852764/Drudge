@@ -1,7 +1,7 @@
 """LLM 客户端 — OpenAI-compatible API 抽象"""
 
 import json
-import time
+import asyncio
 import httpx
 from typing import Any
 
@@ -68,13 +68,13 @@ class LLMClient:
                 last_error = f"HTTP {e.response.status_code}: {e.response.text[:500]}"
                 if e.response.status_code in (429, 503):
                     wait = min(2 ** attempt, 30)
-                    time.sleep(wait)
+                    await asyncio.sleep(wait)
                     continue
                 break
             except (httpx.TimeoutException, httpx.ConnectError) as e:
                 last_error = str(e)
                 if attempt < self.max_retries - 1:
-                    time.sleep(min(2 ** attempt, 10))
+                    await asyncio.sleep(min(2 ** attempt, 10))
                     continue
                 break
 

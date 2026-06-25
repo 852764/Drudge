@@ -1,4 +1,4 @@
-"""工具注册表 — 自注册模式，类似 Hermes 的 tools/registry.py"""
+"""工具注册表 — 自注册模式，类似 Drudge 的 tools/registry.py"""
 
 import json
 import asyncio
@@ -19,6 +19,22 @@ JSON_TYPE_MAP = {
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, dict] = {}  # name -> {schema, handler, toolset, check_fn, is_async}
+        self._runtime_defaults: dict[str, Any] = {}
+
+    def set_runtime_defaults(self, defaults: dict[str, Any]) -> None:
+        self._runtime_defaults = dict(defaults)
+
+    def _merge_args(self, args: dict, handler: Callable) -> dict:
+        merged = dict(args or {})
+        signature = inspect.signature(handler)
+        accepts_kwargs = any(
+            param.kind == inspect.Parameter.VAR_KEYWORD
+            for param in signature.parameters.values()
+        )
+        for key, value in self._runtime_defaults.items():
+            if accepts_kwargs or key in signature.parameters:
+                merged.setdefault(key, value)
+        return merged
 
     def register(
         self,
@@ -89,6 +105,7 @@ class ToolRegistry:
         info = self._tools[tool_name]
         try:
             handler = info["handler"]
+            args = self._merge_args(args, handler)
             if info["is_async"]:
                 result = asyncio.run(handler(**args))
             else:
@@ -105,6 +122,7 @@ class ToolRegistry:
         info = self._tools[tool_name]
         try:
             handler = info["handler"]
+            args = self._merge_args(args, handler)
             if info["is_async"]:
                 result = await handler(**args)
             else:

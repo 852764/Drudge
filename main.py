@@ -1,4 +1,4 @@
-"""Hermes Lite — CLI 入口"""
+"""Drudge Lite — CLI 入口"""
 
 import sys
 import asyncio
@@ -60,9 +60,9 @@ async def run_query(
     agent = Agent(config)
 
     if toolsets:
-        config._config["toolsets"] = toolsets
+        config.override("toolsets", value=toolsets)
     if model:
-        config._config["model"]["name"] = model
+        config.override("model", "name", value=model)
 
     print(f"Drudge v{VERSION}")
     print(f"Model: {config.get('model', 'name')}")
@@ -79,6 +79,8 @@ async def run_query(
     usage = agent.get_token_usage()
     if config.get("display", "show_cost"):
         print(f"\n--- Tokens: {usage['total_tokens']} | Turns: {usage['turns']} ---")
+    if agent.session_id:
+        print(f"Session: {agent.session_id}")
 
 
 def run_interactive(config_path: str | None = None, model: str | None = None) -> None:
@@ -93,7 +95,7 @@ def run_interactive(config_path: str | None = None, model: str | None = None) ->
 
     config = get_config(config_path)
     if model:
-        config._config["model"]["name"] = model
+        config.override("model", "name", value=model)
     agent = Agent(config)
 
     style = Style.from_dict({
@@ -116,7 +118,7 @@ def run_interactive(config_path: str | None = None, model: str | None = None) ->
 
             # 处理 slash 命令
             if user_input.startswith("/"):
-                _handle_command(user_input, config)
+                _handle_command(user_input, config, agent)
                 continue
 
             response = asyncio.run(agent.run(user_input))
@@ -125,6 +127,8 @@ def run_interactive(config_path: str | None = None, model: str | None = None) ->
             usage = agent.get_token_usage()
             if config.get("display", "show_cost"):
                 print(f"Tokens: {usage['total_tokens']} | Turns: {usage['turns']}")
+            if agent.session_id:
+                print(f"Session: {agent.session_id}")
 
         except KeyboardInterrupt:
             print("\nGoodbye!")
@@ -138,7 +142,7 @@ def _run_simple_interactive(config_path: str | None = None, model: str | None = 
     """简单交互模式（不依赖 prompt_toolkit）"""
     config = get_config(config_path)
     if model:
-        config._config["model"]["name"] = model
+        config.override("model", "name", value=model)
     agent = Agent(config)
 
     print(f"Drudge v{VERSION}")
@@ -154,7 +158,7 @@ def _run_simple_interactive(config_path: str | None = None, model: str | None = 
                 continue
 
             if user_input.startswith("/"):
-                _handle_command(user_input, config)
+                _handle_command(user_input, config, agent)
                 continue
 
             response = asyncio.run(agent.run(user_input))
@@ -162,6 +166,8 @@ def _run_simple_interactive(config_path: str | None = None, model: str | None = 
 
             usage = agent.get_token_usage()
             print(f"\nTokens: {usage['total_tokens']} | Turns: {usage['turns']}")
+            if agent.session_id:
+                print(f"Session: {agent.session_id}")
 
         except KeyboardInterrupt:
             print("\nGoodbye!")
@@ -171,7 +177,7 @@ def _run_simple_interactive(config_path: str | None = None, model: str | None = 
             break
 
 
-def _handle_command(cmd: str, config) -> None:
+def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
     """处理 slash 命令"""
     parts = cmd.strip().split()
     command = parts[0].lower()
@@ -185,6 +191,8 @@ def _handle_command(cmd: str, config) -> None:
         print("  /help               Show this help")
         print("  /tools              List available tools")
         print("  /config             Show current config")
+        print("  /sessions           List saved sessions")
+        print("  /history [id]       Show saved messages")
         print("  /clear              Clear screen")
     elif command == "/tools":
         from tools import registry
@@ -196,11 +204,56 @@ def _handle_command(cmd: str, config) -> None:
     elif command == "/config":
         import yaml
         print(yaml.dump(config._config, default_flow_style=False, allow_unicode=True))
+    elif command == "/sessions":
+        _show_sessions(config)
+    elif command == "/history":
+        session_id = parts[1] if len(parts) > 1 else getattr(agent, "session_id", None)
+        if not session_id:
+            print("No active session yet. Run a prompt first or pass /history <session_id>.")
+        else:
+            _show_history(config, session_id)
     elif command == "/clear":
         import os
         os.system("cls" if os.name == "nt" else "clear")
     else:
         print(f"Unknown command: {command}. Type /help for available commands.")
+
+
+def _get_store(config):
+    from agent.storage import ConversationStore
+
+    storage_config = config.get_storage_config()
+    if not storage_config.get("enabled", True):
+        print("Conversation storage is disabled.")
+        return None
+    return ConversationStore(storage_config.get("path", "~/.drudge/drudge.db"))
+
+
+def _show_sessions(config) -> None:
+    store = _get_store(config)
+    if not store:
+        return
+    sessions = store.list_sessions()
+    if not sessions:
+        print("No saved sessions yet.")
+        return
+    for item in sessions:
+        print(f"{item['id']}  {item['updated_at']}  {item['model']}  {item['title']}")
+
+
+def _show_history(config, session_id: str) -> None:
+    store = _get_store(config)
+    if not store:
+        return
+    messages = store.get_messages(session_id)
+    if not messages:
+        print(f"No messages found for session: {session_id}")
+        return
+    for message in messages:
+        content = (message.get("content") or "").replace("\n", " ")
+        if len(content) > 300:
+            content = content[:300] + "..."
+        print(f"[{message['created_at']}] {message['role']}: {content}")
 
 
 def main():

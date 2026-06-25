@@ -3,7 +3,7 @@
 import json
 import subprocess
 import os
-import time
+from pathlib import Path
 from .registry import registry
 
 
@@ -11,9 +11,15 @@ def terminal_handler(
     command: str,
     timeout: int = 180,
     workdir: str | None = None,
+    workspace: str | None = None,
+    allow_outside_workspace: bool = False,
+    allow_terminal: bool = True,
 ) -> str:
     """执行 shell 命令"""
     # 安全检查：危险命令警告
+    if not allow_terminal:
+        return json.dumps({"error": "Terminal tool is disabled by config", "blocked": True})
+
     dangerous_patterns = ["rm -rf /", "mkfs.", "dd if=", ":(){ :|:& };:"]
     for pattern in dangerous_patterns:
         if pattern in command:
@@ -23,7 +29,14 @@ def terminal_handler(
             })
 
     try:
-        cwd = workdir or os.getcwd()
+        cwd = Path(workdir or workspace or os.getcwd()).expanduser().resolve()
+        if workspace and not allow_outside_workspace:
+            workspace_root = Path(workspace).expanduser().resolve()
+            if cwd != workspace_root and workspace_root not in cwd.parents:
+                return json.dumps({
+                    "error": f"Workdir outside workspace is blocked: {cwd}",
+                    "blocked": True,
+                })
 
         if os.name == "nt":
             shell_cmd = ["cmd.exe", "/c", command]
@@ -35,7 +48,7 @@ def terminal_handler(
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=cwd,
+            cwd=str(cwd),
             shell=False,
         )
 

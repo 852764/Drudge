@@ -22,10 +22,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "agent": {
         "max_turns": 50,
         "compression_threshold": 0.80,
+        "refusal_review_enabled": True,
+        "refusal_review_notice": "[Drudge] 检测到模型可能拒绝了请求，正在进行安全二次处理...",
     },
     "display": {
         "show_cost": True,
         "show_tool_calls": True,
+    },
+    "storage": {
+        "enabled": True,
+        "path": os.getenv("DRUDGE_DB_PATH", "~/.drudge/drudge.db"),
+    },
+    "security": {
+        "workspace_root": os.getenv("DRUDGE_WORKSPACE", os.getcwd()),
+        "allow_outside_workspace": False,
+        "allow_terminal": True,
     },
     "toolsets": ["terminal", "file", "web"],
 }
@@ -64,11 +75,27 @@ class ConfigManager:
     def get_agent_config(self) -> dict[str, Any]:
         return self.get("agent", default={})
 
+    def get_storage_config(self) -> dict[str, Any]:
+        return self.get("storage", default={})
+
+    def get_security_config(self) -> dict[str, Any]:
+        return self.get("security", default={})
+
     def get_toolsets(self) -> list[str]:
         toolsets = self.get("toolsets", default=[])
         if isinstance(toolsets, str):
             return [item.strip() for item in toolsets.split(",") if item.strip()]
         return list(toolsets or [])
+
+    def override(self, *keys: str, value: Any) -> None:
+        if not keys:
+            raise ValueError("override requires at least one key")
+        current = self._config
+        for key in keys[:-1]:
+            current = current.setdefault(key, {})
+            if not isinstance(current, dict):
+                raise ValueError(f"Cannot override nested key below non-mapping: {key}")
+        current[keys[-1]] = value
 
     @staticmethod
     def _deep_update(target: dict[str, Any], source: dict[str, Any]) -> None:
