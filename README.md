@@ -79,3 +79,5 @@ python -m unittest discover -s tests -v
 - [使用 Codex 配置](docs/CODEX_CONFIG.md)
 - [Drudge Codex OAuth](docs/CODEX_OAUTH.md)
 - [Priority 1-3 Implementation Notes](docs/PRIORITY_1_2_3.md)
+- [审批、流式输出与取消](docs/APPROVAL_STREAMING.md)
+- [SQLite 会话恢复、AGENTS.md 与 Skills](docs/SESSIONS_AGENTS_SKILLS.md)

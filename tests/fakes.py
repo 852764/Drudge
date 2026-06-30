@@ -13,7 +13,14 @@ class FakeLLM(LLMClient):
         self.responses = list(responses)
         self.requests: list[dict[str, Any]] = []
 
-    async def chat(self, messages, tools=None, tool_choice=None):
+    async def chat(
+        self,
+        messages,
+        tools=None,
+        tool_choice=None,
+        stream_callback=None,
+        cancel_event=None,
+    ):
         self.requests.append({"messages": list(messages), "tools": tools})
         if not self.responses:
             raise AssertionError("FakeLLM response queue is empty")

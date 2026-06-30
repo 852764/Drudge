@@ -57,7 +57,21 @@ Current behavior:
 
 - `auto`: allow normal in-workspace operations and block dangerous command markers.
 - `never`: block mutating file operations, terminal commands, and network requests.
-- `on_request`: reserved for future interactive approval; currently behaves like `auto` for safe operations.
+- `on_request`: low-risk reads run directly; file mutations, network requests, and terminal commands pause for host-side approval. The user can allow once, allow the same tool/risk level for the session, or deny.
+
+The registry enforces approval independently of the model. Calling a medium/high-risk tool directly without an approved host decision returns a blocked result.
+
+## Next-stage priorities 1-2
+
+Implemented:
+
+- Tool risk levels: `low`, `medium`, `high`, and `critical`.
+- Interactive approval UI through `--approval-mode on_request`.
+- Streaming Chat Completions, Responses API, and Codex OAuth output.
+- `Ctrl+C` cancellation without exiting the interactive session.
+- Cancellable terminal subprocesses; timeout/cancel attempts to terminate the complete process tree.
+
+See [Approval, streaming, and cancellation](APPROVAL_STREAMING.md) for behavior and integration details.
 
 ## Priority 3: context management
 
@@ -95,3 +109,7 @@ The test suite covers:
 - repo map private-dir exclusion;
 - context compaction;
 - CLI `doctor` parsing.
+- risk classification and host approval;
+- Chat Completions and Responses SSE parsing;
+- Codex OAuth delta callbacks;
+- terminal subprocess cancellation.

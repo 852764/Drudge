@@ -56,8 +56,11 @@ def compact_messages(messages: list[dict[str, Any]], *, keep_recent: int = 8) ->
     if len(later_messages) <= keep_recent:
         return list(messages)
 
-    old_messages = later_messages[:-keep_recent]
-    recent_messages = later_messages[-keep_recent:]
+    recent_start = max(0, len(later_messages) - keep_recent)
+    while recent_start > 0 and later_messages[recent_start].get("role") == "tool":
+        recent_start -= 1
+    old_messages = later_messages[:recent_start]
+    recent_messages = later_messages[recent_start:]
     summary = summarize_messages(old_messages)
     summary_msg = {
         "role": "user",

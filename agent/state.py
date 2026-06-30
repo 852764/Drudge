@@ -11,7 +11,9 @@ from typing import Any
 class RunStatus(str, Enum):
     IDLE = "idle"
     WAITING_FOR_MODEL = "waiting_for_model"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     EXECUTING_TOOLS = "executing_tools"
+    CANCELLED = "cancelled"
     COMPLETED = "completed"
     FAILED = "failed"
     MAX_TURNS = "max_turns"

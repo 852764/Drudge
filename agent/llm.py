@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import inspect
+import json
+from typing import Any, Callable
 
 import httpx
 
@@ -24,6 +26,7 @@ class LLMClient:
         query_params: dict[str, Any] | None = None,
         timeout: int = 120,
         max_retries: int = 3,
+        transport: httpx.AsyncBaseTransport | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -36,20 +39,31 @@ class LLMClient:
         self.query_params = dict(query_params or {})
         self.timeout = timeout
         self.max_retries = max_retries
+        self._transport = transport
 
     async def chat(
         self,
         messages: list[dict],
         tools: list[dict] | None = None,
         tool_choice: str | None = None,
+        stream_callback: Callable[[str], Any] | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> dict:
         api_order = [self.api_type] if self.api_type != "auto" else ["chat", "responses"]
         last_error = None
         for api_type in api_order:
             try:
                 if api_type == "chat":
+                    if stream_callback:
+                        return await self._chat_completions_stream(
+                            messages, tools, tool_choice, stream_callback, cancel_event
+                        )
                     return await self._chat_completions(messages, tools, tool_choice)
                 if api_type == "responses":
+                    if stream_callback:
+                        return await self._responses_stream(
+                            messages, tools, tool_choice, stream_callback, cancel_event
+                        )
                     return await self._responses(messages, tools, tool_choice)
                 raise RuntimeError(f"Unsupported model.api: {api_type}")
             except RuntimeError as error:
@@ -59,6 +73,19 @@ class LLMClient:
                 raise
         raise RuntimeError(last_error or "LLM request failed")
 
+    @staticmethod
+    async def _emit_delta(callback: Callable[[str], Any] | None, delta: str) -> None:
+        if not callback or not delta:
+            return
+        result = callback(delta)
+        if inspect.isawaitable(result):
+            await result
+
+    @staticmethod
+    def _raise_if_cancelled(cancel_event: asyncio.Event | None) -> None:
+        if cancel_event and cancel_event.is_set():
+            raise asyncio.CancelledError
+
     async def _chat_completions(
         self,
         messages: list[dict],
@@ -67,7 +94,7 @@ class LLMClient:
     ) -> dict:
         url = f"{self.base_url}/chat/completions"
         body = {
-            "messages": messages,
+            "messages": self._messages_to_chat_input(messages),
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
@@ -142,9 +169,228 @@ class LLMClient:
                     break
         raise RuntimeError(f"Responses request failed after {self.max_retries} attempts: {last_error}")
 
+    async def _chat_completions_stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None,
+        tool_choice: str | None,
+        stream_callback: Callable[[str], Any],
+        cancel_event: asyncio.Event | None,
+    ) -> dict:
+        url = f"{self.base_url}/chat/completions"
+        body: dict[str, Any] = {
+            "messages": self._messages_to_chat_input(messages),
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": True,
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = tool_choice or "auto"
+
+        last_error = None
+        for model in self._candidate_models():
+            body["model"] = model
+            for attempt in range(self.max_retries):
+                text_parts: list[str] = []
+                tool_parts: dict[int, dict[str, Any]] = {}
+                usage: dict[str, Any] = {}
+                finish_reason = "stop"
+                saw_terminal = False
+                response_id = ""
+                response_model = model
+                try:
+                    headers = self._request_headers()
+                    headers["Accept"] = "text/event-stream"
+                    async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
+                        async with client.stream(
+                            "POST",
+                            url,
+                            headers=headers,
+                            params=self.query_params or None,
+                            json=body,
+                        ) as response:
+                            if response.status_code >= 400:
+                                await response.aread()
+                                response.raise_for_status()
+                            async for line in response.aiter_lines():
+                                self._raise_if_cancelled(cancel_event)
+                                line = line.strip()
+                                if not line.startswith("data:"):
+                                    continue
+                                raw = line[5:].strip()
+                                if not raw:
+                                    continue
+                                if raw == "[DONE]":
+                                    saw_terminal = True
+                                    break
+                                event = json.loads(raw)
+                                response_id = str(event.get("id") or response_id)
+                                response_model = str(event.get("model") or response_model)
+                                if isinstance(event.get("usage"), dict):
+                                    usage = event["usage"]
+                                choices = event.get("choices") or []
+                                if not choices:
+                                    continue
+                                choice = choices[0]
+                                if choice.get("finish_reason"):
+                                    finish_reason = str(choice["finish_reason"])
+                                    saw_terminal = True
+                                delta = choice.get("delta") or {}
+                                content = delta.get("content")
+                                if isinstance(content, str) and content:
+                                    text_parts.append(content)
+                                    await self._emit_delta(stream_callback, content)
+                                for part in delta.get("tool_calls") or []:
+                                    index = int(part.get("index", 0))
+                                    current = tool_parts.setdefault(index, {
+                                        "id": "",
+                                        "type": "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    })
+                                    if part.get("id"):
+                                        current["id"] = part["id"]
+                                    function = part.get("function") or {}
+                                    current["function"]["name"] += str(function.get("name") or "")
+                                    current["function"]["arguments"] += str(function.get("arguments") or "")
+                    if not saw_terminal:
+                        raise RuntimeError("Chat stream ended without a terminal event")
+                    return {
+                        "id": response_id,
+                        "model": response_model,
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "".join(text_parts),
+                                "tool_calls": [tool_parts[index] for index in sorted(tool_parts)],
+                            },
+                            "finish_reason": finish_reason,
+                        }],
+                        "usage": usage,
+                    }
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(f"Invalid SSE payload from chat/completions: {error}") from error
+                except httpx.HTTPStatusError as error:
+                    last_error = self._format_http_error(error, model, endpoint="chat/completions")
+                    if error.response.status_code in (429, 503) and attempt < self.max_retries - 1:
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    break
+                except (httpx.TimeoutException, httpx.ConnectError) as error:
+                    last_error = str(error)
+                    if text_parts or tool_parts:
+                        raise RuntimeError(
+                            f"Chat stream interrupted after partial output: {error}"
+                        ) from error
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(min(2 ** attempt, 10))
+                        continue
+                    break
+        raise RuntimeError(f"Streaming LLM request failed: {last_error}")
+
+    async def _responses_stream(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None,
+        tool_choice: str | None,
+        stream_callback: Callable[[str], Any],
+        cancel_event: asyncio.Event | None,
+    ) -> dict:
+        url = f"{self.base_url}/responses"
+        body: dict[str, Any] = {
+            "input": self._messages_to_responses_input(messages),
+            "temperature": self.temperature,
+            "max_output_tokens": self.max_tokens,
+            "stream": True,
+        }
+        if tools:
+            body["tools"] = self._tools_to_responses_tools(tools)
+            body["tool_choice"] = tool_choice or "auto"
+
+        last_error = None
+        for model in self._candidate_models():
+            body["model"] = model
+            for attempt in range(self.max_retries):
+                output_items: list[dict] = []
+                text_parts: list[str] = []
+                terminal: dict[str, Any] = {}
+                saw_terminal = False
+                try:
+                    headers = self._request_headers()
+                    headers["Accept"] = "text/event-stream"
+                    async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
+                        async with client.stream(
+                            "POST",
+                            url,
+                            headers=headers,
+                            params=self.query_params or None,
+                            json=body,
+                        ) as response:
+                            if response.status_code >= 400:
+                                await response.aread()
+                                response.raise_for_status()
+                            async for line in response.aiter_lines():
+                                self._raise_if_cancelled(cancel_event)
+                                line = line.strip()
+                                if not line.startswith("data:"):
+                                    continue
+                                raw = line[5:].strip()
+                                if not raw or raw == "[DONE]":
+                                    continue
+                                event = json.loads(raw)
+                                event_type = str(event.get("type") or "")
+                                if event_type == "response.output_text.delta":
+                                    delta = str(event.get("delta") or "")
+                                    if delta:
+                                        text_parts.append(delta)
+                                        await self._emit_delta(stream_callback, delta)
+                                elif event_type == "response.output_item.done":
+                                    item = event.get("item")
+                                    if isinstance(item, dict):
+                                        output_items.append(item)
+                                elif event_type == "error":
+                                    raise RuntimeError(str(event.get("message") or "Responses stream error"))
+                                elif event_type in (
+                                    "response.completed",
+                                    "response.incomplete",
+                                    "response.failed",
+                                ):
+                                    saw_terminal = True
+                                    terminal = event.get("response") or {}
+                                    if event_type == "response.failed":
+                                        raise RuntimeError(f"Responses stream failed: {terminal.get('error') or event}")
+                                    break
+                    if not saw_terminal:
+                        raise RuntimeError("Responses stream ended without a terminal event")
+                    data = dict(terminal)
+                    data.setdefault("model", model)
+                    data.setdefault("status", "completed")
+                    data["output"] = data.get("output") or output_items
+                    data["output_text"] = "".join(text_parts)
+                    return self._responses_to_chat_response(data, model)
+                except json.JSONDecodeError as error:
+                    raise RuntimeError(f"Invalid SSE payload from responses: {error}") from error
+                except httpx.HTTPStatusError as error:
+                    last_error = self._format_http_error(error, model, endpoint="responses")
+                    if error.response.status_code in (429, 503) and attempt < self.max_retries - 1:
+                        await asyncio.sleep(min(2 ** attempt, 30))
+                        continue
+                    break
+                except (httpx.TimeoutException, httpx.ConnectError) as error:
+                    last_error = str(error)
+                    if text_parts or output_items:
+                        raise RuntimeError(
+                            f"Responses stream interrupted after partial output: {error}"
+                        ) from error
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(min(2 ** attempt, 10))
+                        continue
+                    break
+        raise RuntimeError(f"Streaming Responses request failed: {last_error}")
+
     async def _post_json(self, url: str, body: dict) -> dict:
         headers = self._request_headers()
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
             response = await client.post(
                 url,
                 headers=headers,
@@ -157,7 +403,7 @@ class LLMClient:
     async def list_models(self) -> list[str]:
         url = f"{self.base_url}/models"
         headers = self._request_headers()
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
             response = await client.get(
                 url,
                 headers=headers,
@@ -181,6 +427,14 @@ class LLMClient:
         if alias and alias not in models:
             models.append(alias)
         return models
+
+    @staticmethod
+    def _messages_to_chat_input(messages: list[dict]) -> list[dict]:
+        allowed = {"role", "content", "name", "tool_call_id", "tool_calls"}
+        return [
+            {key: value for key, value in message.items() if key in allowed}
+            for message in messages
+        ]
 
     @staticmethod
     def _messages_to_responses_input(messages: list[dict]) -> list[dict]:

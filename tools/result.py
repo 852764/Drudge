@@ -74,11 +74,13 @@ def normalize_tool_payload(value: Any) -> dict[str, Any]:
         else:
             content = json.dumps(content_value, ensure_ascii=False)
 
-        metadata = {
+        explicit_metadata = original.get("metadata")
+        metadata = dict(explicit_metadata) if isinstance(explicit_metadata, dict) else {}
+        metadata.update({
             key: item
             for key, item in original.items()
             if key not in {"ok", "content", "error", "metadata", "blocked"}
-        }
+        })
         payload = ToolResult(
             ok=error is None and not blocked,
             content=content,

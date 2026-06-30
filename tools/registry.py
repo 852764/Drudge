@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from .context import ToolContext
 from .result import normalize_tool_result
+from .risk import RiskLevel, ToolRisk, coerce_risk_level
 
 # JSON Schema property types
 JSON_TYPE_MAP = {
@@ -39,6 +40,8 @@ class ToolRegistry:
         toolset: str = "default",
         check_fn: Callable[[], bool] | None = None,
         required: list[str] | None = None,
+        risk: RiskLevel | str = RiskLevel.LOW,
+        risk_fn: Callable[[dict, ToolContext], ToolRisk] | None = None,
     ):
         """注册一个工具"""
         properties = {}
@@ -78,7 +81,24 @@ class ToolRegistry:
                 for param_name, param_info in parameters.items()
             },
             "required": set(required or list(parameters.keys())),
+            "risk": coerce_risk_level(risk),
+            "risk_fn": risk_fn,
         }
+
+    def assess_risk(
+        self,
+        tool_name: str,
+        args: dict,
+        context: ToolContext,
+    ) -> ToolRisk:
+        """Classify a call using trusted registration metadata, not model input."""
+        info = self._tools.get(tool_name)
+        if info is None:
+            return ToolRisk(RiskLevel.CRITICAL, "Unknown tool", tool_name)
+        if info["risk_fn"] is not None:
+            return info["risk_fn"](args, context)
+        level = info["risk"]
+        return ToolRisk(level, f"Registered {level.value}-risk tool", tool_name)
 
     def get_schemas(self, toolsets: list[str] | None = None) -> list[dict]:
         """获取工具 schema 列表，可过滤工具集"""
@@ -98,6 +118,7 @@ class ToolRegistry:
         tool_name: str,
         args: dict,
         context: ToolContext | None,
+        approved: bool = False,
     ) -> tuple[dict, dict] | str:
         if tool_name not in self._tools:
             return normalize_tool_result({"error": f"Unknown tool: {tool_name}"})
@@ -135,11 +156,42 @@ class ToolRegistry:
                 return normalize_tool_result({
                     "error": f"Invalid type for '{name}': expected {expected.__name__}"
                 })
+        risk = self.assess_risk(tool_name, args, context)
+        if risk.level is RiskLevel.CRITICAL:
+            return normalize_tool_result({
+                "error": f"Critical-risk tool call blocked: {risk.reason}",
+                "blocked": True,
+                "metadata": {
+                    "risk": risk.level.value,
+                    "action": risk.action,
+                },
+            })
+        if (
+            context.approval_mode == "on_request"
+            and risk.requires_approval
+            and not approved
+        ):
+            return normalize_tool_result({
+                "error": f"Approval required for {tool_name}: {risk.reason}",
+                "blocked": True,
+                "metadata": {
+                    "approval_required": True,
+                    "risk": risk.level.value,
+                    "action": risk.action,
+                },
+            })
         return info, self._handler_args(args, info["handler"], context)
 
-    def dispatch(self, tool_name: str, args: dict, context: ToolContext | None = None) -> str:
+    def dispatch(
+        self,
+        tool_name: str,
+        args: dict,
+        context: ToolContext | None = None,
+        *,
+        approved: bool = False,
+    ) -> str:
         """执行工具调用（同步），返回 JSON 字符串"""
-        prepared = self._prepare_call(tool_name, args, context)
+        prepared = self._prepare_call(tool_name, args, context, approved)
         if isinstance(prepared, str):
             return prepared
         info, call_args = prepared
@@ -158,9 +210,11 @@ class ToolRegistry:
         tool_name: str,
         args: dict,
         context: ToolContext | None = None,
+        *,
+        approved: bool = False,
     ) -> str:
         """执行工具调用（异步），用于 Agent 循环中 await async handler"""
-        prepared = self._prepare_call(tool_name, args, context)
+        prepared = self._prepare_call(tool_name, args, context, approved)
         if isinstance(prepared, str):
             return prepared
         info, call_args = prepared

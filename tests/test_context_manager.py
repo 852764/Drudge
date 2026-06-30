@@ -41,6 +41,30 @@ class ContextManagerTests(unittest.TestCase):
         self.assertIn("User:", summary)
         self.assertIn("Tool error", summary)
 
+    def test_compaction_keeps_complete_tool_transaction(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "old"},
+            {"role": "assistant", "content": "old answer"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+            {"role": "user", "content": "latest"},
+        ]
+
+        compacted = compact_messages(messages, keep_recent=2)
+
+        roles = [message["role"] for message in compacted]
+        self.assertEqual(roles[-3:], ["assistant", "tool", "user"])
+        self.assertEqual(compacted[-2]["tool_call_id"], "call-1")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,15 @@ import httpx
 from .context import ToolContext
 from .registry import registry
 from .result import ToolResult
+from .risk import RiskLevel, ToolRisk
+
+
+def _web_risk(args: dict, context: ToolContext) -> ToolRisk:
+    method = str(args.get("method", "GET")).upper()
+    url = str(args.get("url", ""))
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return ToolRisk(RiskLevel.MEDIUM, "Read data from the network", f"{method} {url}")
+    return ToolRisk(RiskLevel.HIGH, "Send or mutate data over the network", f"{method} {url}")
 
 
 async def web_request_handler(
@@ -96,4 +105,5 @@ registry.register(
     toolset="web",
     check_fn=web_check,
     required=["url"],
+    risk_fn=_web_risk,
 )

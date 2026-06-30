@@ -6,6 +6,12 @@ from pathlib import Path
 from .context import ToolContext
 from .registry import registry
 from .result import ToolResult
+from .risk import RiskLevel, ToolRisk
+
+
+def _file_mutation_risk(args: dict, context: ToolContext) -> ToolRisk:
+    path = str(args.get("path", "(unknown path)"))
+    return ToolRisk(RiskLevel.MEDIUM, "Modify a workspace file", path)
 
 
 def _resolve_path(
@@ -244,6 +250,7 @@ registry.register(
     toolset="file",
     check_fn=file_check,
     required=["path", "content"],
+    risk_fn=_file_mutation_risk,
 )
 
 registry.register(
@@ -274,6 +281,7 @@ registry.register(
     toolset="file",
     check_fn=file_check,
     required=["path", "old_string", "new_string"],
+    risk_fn=_file_mutation_risk,
 )
 
 registry.register(
@@ -289,4 +297,5 @@ registry.register(
     toolset="file",
     check_fn=file_check,
     required=["path", "old_string", "new_string"],
+    risk_fn=_file_mutation_risk,
 )

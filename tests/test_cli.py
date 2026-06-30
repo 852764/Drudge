@@ -38,3 +38,19 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.command, "doctor")
         self.assertTrue(args.codex_oauth)
+
+    def test_approval_mode_override(self):
+        with patch("sys.argv", ["drudge", "--approval-mode", "on_request"]):
+            args = parse_args()
+
+        self.assertEqual(args.approval_mode, "on_request")
+
+    def test_resume_and_repeatable_skills(self):
+        with patch(
+            "sys.argv",
+            ["drudge", "--resume", "abc123", "--skill", "review", "--skill", "tests"],
+        ):
+            args = parse_args()
+
+        self.assertEqual(args.resume, "abc123")
+        self.assertEqual(args.skill, ["review", "tests"])

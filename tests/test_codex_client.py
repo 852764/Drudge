@@ -56,12 +56,14 @@ class CodexClientTests(unittest.TestCase):
             credential_resolver=credentials,
             transport=httpx.MockTransport(handler),
         )
+        deltas = []
         response = asyncio.run(client.chat([
             {"role": "system", "content": "system instructions"},
             {"role": "user", "content": "hello"},
-        ]))
+        ], stream_callback=deltas.append))
 
         self.assertEqual(client.extract_text(response), "hello")
+        self.assertEqual(deltas, ["hello"])
         self.assertEqual(client.extract_finish_reason(response), "stop")
         self.assertEqual(captured["body"]["instructions"], "system instructions")
         self.assertTrue(captured["body"]["stream"])

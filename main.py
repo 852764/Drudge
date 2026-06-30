@@ -10,9 +10,53 @@ from pathlib import Path
 from agent import Agent
 from agent.llm import create_client
 from config import ConfigManager, get_config
+from tools import ApprovalDecision, ApprovalRequest
 
 
 VERSION = "0.1.0"
+
+
+class ConsoleApproval:
+    """Interactive approval callback for approval_mode=on_request."""
+
+    async def __call__(self, request: ApprovalRequest) -> ApprovalDecision:
+        if not sys.stdin.isatty():
+            print(
+                f"\n[approval denied] {request.tool_name}: no interactive terminal",
+                file=sys.stderr,
+            )
+            return ApprovalDecision.DENY
+        print(f"\n[approval] risk={request.risk.level.value} tool={request.tool_name}")
+        print(f"Action: {request.risk.action}")
+        answer = await asyncio.to_thread(
+            input,
+            "Allow? [y] once / [a] this tool+risk for session / [N] deny: ",
+        )
+        normalized = answer.strip().lower()
+        if normalized in ("y", "yes"):
+            return ApprovalDecision.ALLOW_ONCE
+        if normalized in ("a", "always"):
+            return ApprovalDecision.ALLOW_SESSION
+        return ApprovalDecision.DENY
+
+
+class _StreamPrinter:
+    def __init__(self) -> None:
+        self.seen = False
+
+    def __call__(self, delta: str) -> None:
+        self.seen = True
+        print(delta, end="", flush=True)
+
+
+async def _run_and_print(agent: Agent, query: str) -> str:
+    printer = _StreamPrinter()
+    response = await agent.run(query, stream_callback=printer)
+    if printer.seen:
+        print()
+    else:
+        print(response)
+    return response
 
 
 def _validate_runtime_config(config) -> None:
@@ -85,6 +129,23 @@ def parse_args() -> argparse.Namespace:
         help="Disable tool schemas for this run",
     )
     parser.add_argument(
+        "--approval-mode",
+        choices=("auto", "on_request", "never"),
+        help="Tool approval policy override",
+    )
+    parser.add_argument(
+        "--resume",
+        metavar="SESSION_ID",
+        help="Resume a saved SQLite conversation session",
+    )
+    parser.add_argument(
+        "--skill",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Activate a local skill (repeatable)",
+    )
+    parser.add_argument(
         "--version", "-V",
         action="store_true",
         help="Show version",
@@ -111,6 +172,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _configure_agent_extensions(
+    agent: Agent,
+    resume_id: str | None,
+    skill_names: list[str] | None,
+) -> None:
+    if resume_id:
+        session = agent.resume_session(resume_id)
+        print(
+            f"Resumed session {session['id']}: {session['message_count']} messages, "
+            f"{session['repaired_tool_calls']} repaired tool calls"
+        )
+    for name in skill_names or []:
+        skill = agent.activate_skill(name)
+        print(f"Activated skill: {skill.name} ({skill.description})")
+
+
 async def run_query(
     query: str,
     config_path: str | None = None,
@@ -119,6 +196,9 @@ async def run_query(
     no_tools: bool = False,
     codex_config_path: str | None = None,
     codex_oauth: bool = False,
+    approval_mode: str | None = None,
+    resume_id: str | None = None,
+    skill_names: list[str] | None = None,
 ) -> None:
     """执行单次查询"""
     config = get_config(config_path, codex_config_path)
@@ -131,8 +211,10 @@ async def run_query(
         config.override("model", "name", value=model)
     if codex_oauth:
         config.enable_codex_oauth()
+    if approval_mode:
+        config.override("security", "approval_mode", value=approval_mode)
     _validate_runtime_config(config)
-    agent = Agent(config)
+    agent = Agent(config, approval_callback=ConsoleApproval())
 
     print(f"Drudge v{VERSION}")
     print(f"Model: {config.get('model', 'name')}")
@@ -142,8 +224,11 @@ async def run_query(
     print("-" * 60)
 
     try:
-        response = await agent.run(query)
-        print("\n" + response)
+        _configure_agent_extensions(agent, resume_id, skill_names)
+        print()
+        await _run_and_print(agent, query)
+    except asyncio.CancelledError:
+        print("\nCancelled.", file=sys.stderr)
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         sys.exit(1)
@@ -188,6 +273,9 @@ def run_interactive(
     no_tools: bool = False,
     codex_config_path: str | None = None,
     codex_oauth: bool = False,
+    approval_mode: str | None = None,
+    resume_id: str | None = None,
+    skill_names: list[str] | None = None,
 ) -> None:
     """交互式对话模式"""
     try:
@@ -201,6 +289,9 @@ def run_interactive(
             no_tools,
             codex_config_path,
             codex_oauth,
+            approval_mode,
+            resume_id,
+            skill_names,
         )
         return
 
@@ -211,8 +302,15 @@ def run_interactive(
         config.override("toolsets", value=[])
     if codex_oauth:
         config.enable_codex_oauth()
+    if approval_mode:
+        config.override("security", "approval_mode", value=approval_mode)
     _validate_runtime_config(config)
-    agent = Agent(config)
+    agent = Agent(config, approval_callback=ConsoleApproval())
+    try:
+        _configure_agent_extensions(agent, resume_id, skill_names)
+    except (KeyError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return
 
     style = Style.from_dict({
         "prompt": "ansicyan bold",
@@ -239,8 +337,12 @@ def run_interactive(
                 _handle_command(user_input, config, agent)
                 continue
 
-            response = asyncio.run(agent.run(user_input))
-            print(response)
+            try:
+                asyncio.run(_run_and_print(agent, user_input))
+            except KeyboardInterrupt:
+                agent.cancel()
+                print("\nCancelled. Ready for the next prompt.")
+                continue
 
             usage = agent.get_token_usage()
             if config.get("display", "show_cost"):
@@ -262,6 +364,9 @@ def _run_simple_interactive(
     no_tools: bool = False,
     codex_config_path: str | None = None,
     codex_oauth: bool = False,
+    approval_mode: str | None = None,
+    resume_id: str | None = None,
+    skill_names: list[str] | None = None,
 ) -> None:
     """简单交互模式（不依赖 prompt_toolkit）"""
     config = get_config(config_path, codex_config_path)
@@ -271,8 +376,15 @@ def _run_simple_interactive(
         config.override("toolsets", value=[])
     if codex_oauth:
         config.enable_codex_oauth()
+    if approval_mode:
+        config.override("security", "approval_mode", value=approval_mode)
     _validate_runtime_config(config)
-    agent = Agent(config)
+    agent = Agent(config, approval_callback=ConsoleApproval())
+    try:
+        _configure_agent_extensions(agent, resume_id, skill_names)
+    except (KeyError, RuntimeError) as exc:
+        print(str(exc), file=sys.stderr)
+        return
 
     print(f"Drudge v{VERSION}")
     print(f"Model: {config.get('model', 'name')}")
@@ -292,8 +404,12 @@ def _run_simple_interactive(
                 _handle_command(user_input, config, agent)
                 continue
 
-            response = asyncio.run(agent.run(user_input))
-            print(response)
+            try:
+                asyncio.run(_run_and_print(agent, user_input))
+            except KeyboardInterrupt:
+                agent.cancel()
+                print("\nCancelled. Ready for the next prompt.")
+                continue
 
             usage = agent.get_token_usage()
             print(f"\nTokens: {usage['total_tokens']} | Turns: {usage['turns']}")
@@ -325,6 +441,13 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         print("  /models             List provider models")
         print("  /sessions           List saved sessions")
         print("  /history [id]       Show saved messages")
+        print("  /resume <id>        Resume a saved session")
+        print("  /new                Start a new session")
+        print("  /skills             List discovered skills")
+        print("  /skill <name>       Activate a skill")
+        print("  /skill off <name>   Deactivate a skill")
+        print("  /skill show <name>  Show skill metadata")
+        print("  /skill clear        Deactivate all skills")
         print("  /clear              Clear screen")
     elif command == "/tools":
         from tools import registry
@@ -346,11 +469,83 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
             print("No active session yet. Run a prompt first or pass /history <session_id>.")
         else:
             _show_history(config, session_id)
+    elif command == "/resume":
+        if agent is None:
+            print("Agent is unavailable.")
+        elif len(parts) < 2:
+            print("Usage: /resume <session_id>")
+        else:
+            try:
+                session = agent.resume_session(parts[1])
+                print(
+                    f"Resumed {session['id']}: {session['title']} "
+                    f"({session['message_count']} messages, "
+                    f"{session['repaired_tool_calls']} repaired tool calls)"
+                )
+                if session["active_skills"]:
+                    print(f"Active skills: {', '.join(session['active_skills'])}")
+            except (KeyError, RuntimeError) as exc:
+                print(str(exc))
+    elif command == "/new":
+        if agent is not None:
+            agent.new_session()
+        print("Started a new session. Active skills were kept.")
+    elif command == "/skills":
+        _show_skills(agent)
+    elif command == "/skill":
+        _handle_skill_command(parts[1:], agent)
     elif command == "/clear":
         import os
         os.system("cls" if os.name == "nt" else "clear")
     else:
         print(f"Unknown command: {command}. Type /help for available commands.")
+
+
+def _show_skills(agent: Agent | None) -> None:
+    if agent is None:
+        print("Agent is unavailable.")
+        return
+    skills = agent.list_skills()
+    if not skills:
+        print("No skills found under .drudge/skills/*/SKILL.md")
+        return
+    for skill in skills:
+        marker = "*" if skill["active"] else " "
+        print(f"[{marker}] {skill['name']}: {skill['description']}")
+
+
+def _handle_skill_command(arguments: list[str], agent: Agent | None) -> None:
+    if agent is None:
+        print("Agent is unavailable.")
+        return
+    if not arguments:
+        print("Usage: /skill <name> | off <name> | show <name> | clear")
+        return
+    action = arguments[0].lower()
+    try:
+        if action == "clear":
+            agent.clear_skills()
+            print("All skills deactivated.")
+        elif action == "off":
+            if len(arguments) < 2:
+                print("Usage: /skill off <name>")
+            elif agent.deactivate_skill(arguments[1]):
+                print(f"Deactivated skill: {arguments[1]}")
+            else:
+                print(f"Skill is not active: {arguments[1]}")
+        elif action == "show":
+            if len(arguments) < 2:
+                print("Usage: /skill show <name>")
+            else:
+                skill = agent.get_skill(arguments[1])
+                print(f"Name: {skill.name}")
+                print(f"Description: {skill.description}")
+                print(f"Path: {skill.path}")
+        else:
+            skill = agent.activate_skill(arguments[0])
+            print(f"Activated skill: {skill.name} ({skill.description})")
+    except KeyError as exc:
+        print(str(exc))
 
 
 def _get_store(config):
@@ -433,6 +628,7 @@ def run_doctor(
     no_tools: bool = False,
     codex_config_path: str | None = None,
     codex_oauth: bool = False,
+    approval_mode: str | None = None,
 ) -> None:
     config = get_config(config_path, codex_config_path)
     if model:
@@ -441,6 +637,8 @@ def run_doctor(
         config.override("toolsets", value=[])
     if codex_oauth:
         config.enable_codex_oauth()
+    if approval_mode:
+        config.override("security", "approval_mode", value=approval_mode)
 
     print(f"Drudge v{VERSION} doctor")
     print(f"Python: {sys.version.split()[0]}")
@@ -484,6 +682,26 @@ def run_doctor(
     for name in sorted(registry.list_tools(config.get_toolsets())):
         print(f"  - {name}")
 
+    from agent.project_instructions import load_project_instructions
+    from agent.skills import SkillManager
+
+    instruction_files = load_project_instructions(
+        workspace,
+        cwd=Path.cwd(),
+        filename=str(config.get("agent", "instructions_filename", default="AGENTS.md")),
+        max_chars=int(config.get("agent", "instructions_max_chars", default=64_000)),
+    ) if config.get("agent", "instructions_enabled", default=True) else []
+    print(f"AGENTS.md files: {len(instruction_files)}")
+    for item in instruction_files:
+        print(f"  - {item.path}")
+    skills = SkillManager(
+        workspace,
+        max_chars=int(config.get("agent", "skill_max_chars", default=32_000)),
+    ).discover()
+    print(f"Skills discovered: {len(skills)}")
+    for skill in skills.values():
+        print(f"  - {skill.name}: {skill.description}")
+
     git_summary = _git_status_summary(workspace)
     if git_summary:
         print("Git:")
@@ -521,6 +739,7 @@ def main():
             args.no_tools,
             args.codex_config,
             args.codex_oauth,
+            args.approval_mode,
         )
         return
 
@@ -544,15 +763,21 @@ def main():
 
     if args.query:
         # 单次查询
-        asyncio.run(run_query(
-            args.query,
-            config_path=args.config,
-            codex_config_path=args.codex_config,
-            toolsets=toolsets,
-            model=args.model,
-            no_tools=args.no_tools,
-            codex_oauth=args.codex_oauth,
-        ))
+        try:
+            asyncio.run(run_query(
+                args.query,
+                config_path=args.config,
+                codex_config_path=args.codex_config,
+                toolsets=toolsets,
+                model=args.model,
+                no_tools=args.no_tools,
+                codex_oauth=args.codex_oauth,
+                approval_mode=args.approval_mode,
+                resume_id=args.resume,
+                skill_names=args.skill,
+            ))
+        except KeyboardInterrupt:
+            print("\nCancelled.", file=sys.stderr)
     else:
         # 交互模式
         run_interactive(
@@ -561,6 +786,9 @@ def main():
             args.no_tools,
             args.codex_config,
             args.codex_oauth,
+            args.approval_mode,
+            args.resume,
+            args.skill,
         )
 
 

@@ -43,15 +43,21 @@ class CodexOAuthClient(LLMClient):
         messages: list[dict],
         tools: list[dict] | None = None,
         tool_choice: str | None = None,
+        stream_callback: Callable[[str], Any] | None = None,
+        cancel_event: asyncio.Event | None = None,
     ) -> dict:
         credentials = await asyncio.to_thread(self._credential_resolver, False)
         try:
-            return await self._stream_response(messages, tools, tool_choice, credentials)
+            return await self._stream_response(
+                messages, tools, tool_choice, credentials, stream_callback, cancel_event
+            )
         except CodexProviderError as exc:
             if exc.status_code != 401:
                 raise
         credentials = await asyncio.to_thread(self._credential_resolver, True)
-        return await self._stream_response(messages, tools, tool_choice, credentials)
+        return await self._stream_response(
+            messages, tools, tool_choice, credentials, stream_callback, cancel_event
+        )
 
     @staticmethod
     def _instructions_and_input(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -87,6 +93,8 @@ class CodexOAuthClient(LLMClient):
         tools: list[dict] | None,
         tool_choice: str | None,
         credentials: dict[str, Any],
+        stream_callback: Callable[[str], Any] | None,
+        cancel_event: asyncio.Event | None,
     ) -> dict:
         instructions, response_input = self._instructions_and_input(messages)
         body: dict[str, Any] = {
@@ -116,9 +124,14 @@ class CodexOAuthClient(LLMClient):
                         f"Codex backend HTTP {response.status_code}: {raw}",
                         status_code=response.status_code,
                     )
-                return await self._consume_sse(response)
+                return await self._consume_sse(response, stream_callback, cancel_event)
 
-    async def _consume_sse(self, response: httpx.Response) -> dict:
+    async def _consume_sse(
+        self,
+        response: httpx.Response,
+        stream_callback: Callable[[str], Any] | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> dict:
         output_items: list[dict] = []
         text_parts: list[str] = []
         usage: dict[str, Any] = {}
@@ -127,6 +140,7 @@ class CodexOAuthClient(LLMClient):
         saw_terminal = False
 
         async for line in response.aiter_lines():
+            self._raise_if_cancelled(cancel_event)
             line = line.strip()
             if not line.startswith("data:"):
                 continue
@@ -141,7 +155,9 @@ class CodexOAuthClient(LLMClient):
             if event_type == "error":
                 raise CodexProviderError(str(event.get("message") or "Codex stream error"))
             if event_type == "response.output_text.delta" and event.get("delta"):
-                text_parts.append(str(event["delta"]))
+                delta = str(event["delta"])
+                text_parts.append(delta)
+                await self._emit_delta(stream_callback, delta)
             elif event_type == "response.output_item.done":
                 item = event.get("item")
                 if isinstance(item, dict):

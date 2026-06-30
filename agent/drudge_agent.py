@@ -1,14 +1,26 @@
 """核心 牛马，其他的牛马都是这个牛马来的 — 工具调用 + LLM 交互 + 上下文管理"""
 
+import asyncio
+import inspect
 import json
-from typing import Any
+from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 from .llm import LLMClient, create_client
 from .context_manager import build_repo_map, compact_messages, summarize_messages
 from .refusal import build_refusal_review_messages, is_refusal
 from .storage import ConversationStore
+from .project_instructions import load_project_instructions, render_project_instructions
+from .skills import Skill, SkillManager
 from .state import AgentRunState, RunStatus
-from tools import ToolContext, registry
+from tools import (
+    ApprovalDecision,
+    ApprovalRequest,
+    RiskLevel,
+    ToolContext,
+    ToolResult,
+    registry,
+)
 from prompt import build_system_prompt
 from config import get_config, ConfigManager
 from utils import truncate_string
@@ -20,7 +32,13 @@ MAX_TOOL_RESULT_CHARS = 10000
 class Agent:
     """核心 Agent"""
 
-    def __init__(self, config: ConfigManager | None = None):
+    def __init__(
+        self,
+        config: ConfigManager | None = None,
+        approval_callback: Callable[
+            [ApprovalRequest], ApprovalDecision | str | Awaitable[ApprovalDecision | str]
+        ] | None = None,
+    ):
         self.config = config or get_config()
         self.llm: LLMClient | None = None
         self.refusal_llm: LLMClient | None = None
@@ -31,13 +49,190 @@ class Agent:
         self.store: ConversationStore | None = None
         self.tool_context: ToolContext | None = None
         self.run_state = AgentRunState()
+        self.approval_callback = approval_callback
+        self._session_approvals: set[tuple[str, str]] = set()
+        self._cancel_event = asyncio.Event()
+        self._active_task: asyncio.Task | None = None
+        workspace = self.config.get("security", "workspace_root", default=".")
+        self.skill_manager = SkillManager(
+            workspace,
+            max_chars=int(self.config.get("agent", "skill_max_chars", default=32_000)),
+        )
+        self.active_skill_names: list[str] = []
         self._init_store()
+
+    def cancel(self) -> None:
+        """Request cancellation of the current model/tool operation."""
+        self._cancel_event.set()
+        task = self._active_task
+        if task and not task.done():
+            task.get_loop().call_soon_threadsafe(task.cancel)
+
+    async def _emit(self, callback: Any, text: str) -> None:
+        if not callback or not text:
+            return
+        result = callback(text)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _approve_tool(self, tool_name: str, args: dict) -> bool:
+        if not self.tool_context or self.tool_context.approval_mode != "on_request":
+            return True
+        risk = registry.assess_risk(tool_name, args, self.tool_context)
+        if not risk.requires_approval:
+            return True
+        if risk.level is RiskLevel.CRITICAL:
+            return False
+        approval_key = (tool_name, risk.level.value)
+        if approval_key in self._session_approvals:
+            return True
+        if self.approval_callback is None:
+            return False
+
+        self.run_state.transition(
+            RunStatus.WAITING_FOR_APPROVAL,
+            turn=self._turn_count,
+            tool=tool_name,
+            risk=risk.level.value,
+            action=risk.action,
+        )
+        decision = self.approval_callback(ApprovalRequest(tool_name, args, risk))
+        if inspect.isawaitable(decision):
+            decision = await decision
+        try:
+            parsed = decision if isinstance(decision, ApprovalDecision) else ApprovalDecision(str(decision))
+        except ValueError:
+            parsed = ApprovalDecision.DENY
+        if parsed is ApprovalDecision.ALLOW_SESSION:
+            self._session_approvals.add(approval_key)
+            return True
+        return parsed is ApprovalDecision.ALLOW_ONCE
 
     def _init_store(self) -> None:
         storage_config = self.config.get_storage_config()
         if not storage_config.get("enabled", True):
             return
         self.store = ConversationStore(storage_config.get("path", "~/.drudge/drudge.db"))
+
+    def list_skills(self) -> list[dict[str, Any]]:
+        discovered = self.skill_manager.discover()
+        return [
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "path": str(skill.path),
+                "active": skill.name in self.active_skill_names,
+            }
+            for skill in discovered.values()
+        ]
+
+    def get_skill(self, name: str) -> Skill:
+        return self.skill_manager.get(name)
+
+    def activate_skill(self, name: str) -> Skill:
+        skill = self.skill_manager.get(name)
+        if skill.name not in self.active_skill_names:
+            self.active_skill_names.append(skill.name)
+        self._persist_session_extensions()
+        self._refresh_system_message()
+        return skill
+
+    def deactivate_skill(self, name: str) -> bool:
+        if name not in self.active_skill_names:
+            return False
+        self.active_skill_names.remove(name)
+        self._persist_session_extensions()
+        self._refresh_system_message()
+        return True
+
+    def clear_skills(self) -> None:
+        self.active_skill_names.clear()
+        self._persist_session_extensions()
+        self._refresh_system_message()
+
+    def _persist_session_extensions(self) -> None:
+        if self.store and self.session_id:
+            self.store.update_session_metadata(
+                self.session_id,
+                {"active_skills": list(self.active_skill_names)},
+            )
+
+    def new_session(self, *, clear_skills: bool = False) -> None:
+        self._messages = []
+        self.session_id = None
+        self._turn_count = 0
+        self._total_tokens = 0
+        self._session_approvals.clear()
+        self.run_state = AgentRunState()
+        if clear_skills:
+            self.active_skill_names.clear()
+
+    def resume_session(self, session_id: str) -> dict[str, Any]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        session = self.store.get_session(session_id)
+        if session is None:
+            raise KeyError(f"Session not found: {session_id}")
+        rows = self.store.get_messages(session_id, limit=None)
+        if not rows:
+            raise RuntimeError(f"Session has no messages: {session_id}")
+
+        metadata = session.get("metadata") or {}
+        available = self.skill_manager.discover()
+        self.active_skill_names = [
+            str(name)
+            for name in metadata.get("active_skills", [])
+            if str(name) in available
+        ]
+        self.session_id = session_id
+        self._messages = [self._restore_message(row) for row in rows]
+        assistant_turns = sum(1 for message in self._messages if message.get("role") == "assistant")
+        self._turn_count = max(self.store.get_max_turn(session_id), assistant_turns)
+        self._total_tokens = 0
+        self._session_approvals.clear()
+        repaired = self._repair_incomplete_tool_transactions()
+        self._refresh_system_message()
+        result = dict(session)
+        result["message_count"] = len(self._messages)
+        result["repaired_tool_calls"] = repaired
+        result["active_skills"] = list(self.active_skill_names)
+        return result
+
+    @staticmethod
+    def _restore_message(row: dict[str, Any]) -> dict[str, Any]:
+        message: dict[str, Any] = {
+            "role": row.get("role", "user"),
+            "content": row.get("content"),
+        }
+        if row.get("tool_call_id"):
+            message["tool_call_id"] = row["tool_call_id"]
+        metadata = row.get("metadata") or {}
+        for key in ("tool_calls", "provider_items"):
+            if metadata.get(key):
+                message[key] = metadata[key]
+        return message
+
+    def _repair_incomplete_tool_transactions(self) -> int:
+        pending: dict[str, str] = {}
+        for message in self._messages:
+            if message.get("role") == "assistant":
+                for call in message.get("tool_calls", []) or []:
+                    call_id = str(call.get("id") or "")
+                    if call_id:
+                        name = str((call.get("function") or {}).get("name") or "unknown")
+                        pending[call_id] = name
+            elif message.get("role") == "tool":
+                pending.pop(str(message.get("tool_call_id") or ""), None)
+
+        for call_id, name in pending.items():
+            content = ToolResult.failure(
+                f"Tool call interrupted before completion: {name}",
+                interrupted=True,
+            ).to_json()
+            message = {"role": "tool", "tool_call_id": call_id, "content": content}
+            self._messages.append(message)
+            self._persist_message("tool", content, tool_call_id=call_id, metadata={"repaired": True})
+        return len(pending)
 
     def _init_llm(self) -> None:
         """初始化 LLM 客户端"""
@@ -62,19 +257,66 @@ class Agent:
         skills: list[str] | None = None,
     ) -> list[dict]:
         """构建初始消息列表"""
+        system_content = self._build_system_content(memory_entries, skills)
+
+        return [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    def _build_system_content(
+        self,
+        memory_entries: list[str] | None = None,
+        extra_skills: list[str] | None = None,
+    ) -> str:
         toolsets = self.config.get_toolsets()
+        workspace = self.config.get("security", "workspace_root", default=".")
         repo_map = None
         if self.config.get("agent", "repo_map_enabled", default=True):
             repo_map = build_repo_map(
                 self.config.get("security", "workspace_root", default="."),
                 max_files=int(self.config.get("agent", "repo_map_max_files", default=80)),
             )
-        system_content = build_system_prompt(toolsets, memory_entries, skills, repo_map=repo_map)
+        project_instructions = None
+        if self.config.get("agent", "instructions_enabled", default=True):
+            items = load_project_instructions(
+                workspace,
+                cwd=Path.cwd(),
+                filename=str(self.config.get("agent", "instructions_filename", default="AGENTS.md")),
+                max_chars=int(self.config.get("agent", "instructions_max_chars", default=64_000)),
+            )
+            project_instructions = render_project_instructions(items, workspace) if items else None
 
-        return [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": user_prompt},
-        ]
+        discovered = self.skill_manager.discover()
+        catalog = [(skill.name, skill.description) for skill in discovered.values()]
+        loaded_skills = []
+        for name in self.active_skill_names:
+            skill = discovered.get(name)
+            if skill:
+                loaded_skills.append(skill.render())
+        loaded_skills.extend(extra_skills or [])
+        return build_system_prompt(
+            toolsets,
+            memory_entries,
+            loaded_skills,
+            repo_map=repo_map,
+            project_instructions=project_instructions,
+            skill_catalog=catalog,
+        )
+
+    def _refresh_system_message(
+        self,
+        memory_entries: list[str] | None = None,
+        extra_skills: list[str] | None = None,
+    ) -> None:
+        if not self._messages:
+            return
+        system = {"role": "system", "content": self._build_system_content(memory_entries, extra_skills)}
+        for index, message in enumerate(self._messages):
+            if message.get("role") == "system":
+                self._messages[index] = system
+                return
+        self._messages.insert(0, system)
 
     def _ensure_session(self, prompt: str, memory_entries: list[str] | None, skills: list[str] | None) -> None:
         if self._messages:
@@ -87,7 +329,12 @@ class Agent:
             return
 
         model = self.config.get("model", "name", default="unknown")
-        self.session_id = self.store.create_session(prompt, model)
+        self.session_id = self.store.create_session(
+            prompt,
+            model,
+            cwd=str(Path.cwd()),
+            metadata={"active_skills": list(self.active_skill_names)},
+        )
         for message in self._messages:
             self._persist_message(message["role"], message.get("content"))
 
@@ -112,7 +359,12 @@ class Agent:
         if self.store and self.session_id:
             self.store.append_tool_call(self.session_id, self._turn_count, name, args, result)
 
-    async def _review_refusal_if_needed(self, user_prompt: str, response_text: str) -> str:
+    async def _review_refusal_if_needed(
+        self,
+        user_prompt: str,
+        response_text: str,
+        stream_callback: Any = None,
+    ) -> str:
         agent_config = self.config.get_agent_config()
         if not agent_config.get("refusal_review_enabled", True):
             return response_text
@@ -133,7 +385,10 @@ class Agent:
         review_text = self.refusal_llm.extract_text(review_response) or response_text
         self._messages.append({"role": "assistant", "content": review_text})
         self._persist_message("assistant", review_text, metadata={"refusal_review": True})
-        return f"{notice}\n\n{review_text}"
+        reviewed = f"{notice}\n\n{review_text}"
+        if stream_callback:
+            await self._emit(stream_callback, f"\n\n{reviewed}")
+        return reviewed
 
     async def run(
         self,
@@ -155,6 +410,9 @@ class Agent:
             最终响应文本
         """
         self._init_llm()
+        self._cancel_event = asyncio.Event()
+        self._active_task = asyncio.current_task()
+        self._refresh_system_message(memory_entries, skills)
         self._ensure_session(prompt, memory_entries, skills)
 
         max_turns = self.config.get_agent_config().get("max_turns", 50)
@@ -179,11 +437,26 @@ class Agent:
             if estimated > context_limit * compression_threshold:
                 self._compress_context()
 
+            turn_streamed = False
+
+            async def emit_delta(delta: str) -> None:
+                nonlocal turn_streamed
+                if not delta:
+                    return
+                turn_streamed = True
+                await self._emit(stream_callback, delta)
+
             try:
                 response = await self.llm.chat(
                     self._messages,
                     tools=tool_schemas if tool_schemas else None,
+                    stream_callback=emit_delta if stream_callback else None,
+                    cancel_event=self._cancel_event,
                 )
+            except asyncio.CancelledError:
+                self.run_state.transition(RunStatus.CANCELLED, turn=request_turn)
+                self._active_task = None
+                raise
             except Exception as e:
                 error_msg = f"LLM call failed (turn {self._turn_count}): {e}"
                 self.run_state.transition(
@@ -241,11 +514,43 @@ class Agent:
                         })
                         persisted_args = {"_raw": tool_args_str}
                     else:
-                        tool_result = await registry.dispatch_async(
-                            tool_name,
-                            tool_args,
-                            context=self.tool_context,
-                        )
+                        try:
+                            approved = await self._approve_tool(tool_name, tool_args)
+                        except asyncio.CancelledError:
+                            self.run_state.transition(RunStatus.CANCELLED, turn=request_turn)
+                            self._active_task = None
+                            raise
+                        if approved:
+                            self.run_state.transition(
+                                RunStatus.EXECUTING_TOOLS,
+                                turn=request_turn,
+                                tool=tool_name,
+                            )
+                            try:
+                                tool_result = await registry.dispatch_async(
+                                    tool_name,
+                                    tool_args,
+                                    context=self.tool_context,
+                                    approved=True,
+                                )
+                            except asyncio.CancelledError:
+                                self.run_state.transition(RunStatus.CANCELLED, turn=request_turn)
+                                self._active_task = None
+                                raise
+                        else:
+                            risk = registry.assess_risk(tool_name, tool_args, self.tool_context)
+                            error = (
+                                f"Critical-risk tool call blocked: {risk.reason}"
+                                if risk.level is RiskLevel.CRITICAL
+                                else f"User approval denied for {tool_name}"
+                            )
+                            tool_result = ToolResult.failure(
+                                error,
+                                blocked=True,
+                                approval_required=True,
+                                risk=risk.level.value,
+                                action=risk.action,
+                            ).to_json()
                         persisted_args = tool_args if isinstance(tool_args, dict) else {"_raw": tool_args}
                     tool_result = truncate_string(tool_result, MAX_TOOL_RESULT_CHARS)
 
@@ -268,8 +573,8 @@ class Agent:
             if text:
                 self._messages.append({"role": "assistant", "content": text})
                 self._persist_message("assistant", text)
-                if stream_callback:
-                    stream_callback(text)
+                if stream_callback and not turn_streamed:
+                    await self._emit(stream_callback, text)
 
             if text:
                 final_text = text
@@ -291,7 +596,14 @@ class Agent:
             self.run_state.transition(RunStatus.MAX_TURNS, turn=max_turns)
             final_text = f"[Agent reached maximum turns ({max_turns}). Task may be incomplete.]"
 
-        return await self._review_refusal_if_needed(prompt, final_text)
+        try:
+            reviewed = await self._review_refusal_if_needed(prompt, final_text, stream_callback)
+        except asyncio.CancelledError:
+            self.run_state.transition(RunStatus.CANCELLED, turn=self.run_state.turn)
+            self._active_task = None
+            raise
+        self._active_task = None
+        return reviewed
 
     def _compress_context(self) -> None:
         """压缩上下文：保留系统消息 + 最近 N 轮 + 会话摘要"""
