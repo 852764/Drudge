@@ -3,6 +3,7 @@
 import json
 import re
 import httpx
+from .context import ToolContext
 from .registry import registry
 
 
@@ -12,10 +13,15 @@ async def web_request_handler(
     headers: dict | None = None,
     body: str | None = None,
     timeout: int = 30,
+    context: ToolContext | None = None,
 ) -> str:
     """发送 HTTP 请求"""
     if not url.startswith(("http://", "https://")):
         return json.dumps({"error": "URL must start with http:// or https://"})
+    if context is None:
+        return json.dumps({"error": "ToolContext is required", "blocked": True})
+    if not context.allow_network:
+        return json.dumps({"error": "Network tools are disabled by config", "blocked": True})
 
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:

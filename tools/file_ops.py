@@ -3,36 +3,29 @@
 import json
 import re
 from pathlib import Path
+from .context import ToolContext
 from .registry import registry
 
 
 def _resolve_path(
     path: str,
-    workspace: str | None = None,
-    allow_outside_workspace: bool = False,
+    context: ToolContext | None,
 ) -> Path:
     """解析路径，支持 ~/ 和相对路径"""
-    p = Path(path).expanduser()
-    if not p.is_absolute() and workspace:
-        p = Path(workspace) / p
-    resolved = p.resolve()
-    if workspace and not allow_outside_workspace:
-        workspace_root = Path(workspace).expanduser().resolve()
-        if resolved != workspace_root and workspace_root not in resolved.parents:
-            raise PermissionError(f"Path outside workspace is blocked: {resolved}")
-    return resolved
+    if context is None:
+        raise PermissionError("ToolContext is required")
+    return context.resolve_path(path)
 
 
 def read_file_handler(
     path: str,
     offset: int = 1,
     limit: int = 500,
-    workspace: str | None = None,
-    allow_outside_workspace: bool = False,
+    context: ToolContext | None = None,
 ) -> str:
     """读取文件内容，返回带行号的内容"""
     try:
-        filepath = _resolve_path(path, workspace, allow_outside_workspace)
+        filepath = _resolve_path(path, context)
     except PermissionError as e:
         return json.dumps({"error": str(e), "blocked": True})
     if not filepath.exists():
@@ -68,12 +61,11 @@ def read_file_handler(
 def write_file_handler(
     path: str,
     content: str,
-    workspace: str | None = None,
-    allow_outside_workspace: bool = False,
+    context: ToolContext | None = None,
 ) -> str:
     """写入文件内容（覆盖）"""
     try:
-        filepath = _resolve_path(path, workspace, allow_outside_workspace)
+        filepath = _resolve_path(path, context)
     except PermissionError as e:
         return json.dumps({"error": str(e), "blocked": True})
     try:
@@ -94,12 +86,11 @@ def search_files_handler(
     path: str = ".",
     file_glob: str | None = None,
     limit: int = 50,
-    workspace: str | None = None,
-    allow_outside_workspace: bool = False,
+    context: ToolContext | None = None,
 ) -> str:
     """搜索文件内容"""
     try:
-        search_path = _resolve_path(path, workspace, allow_outside_workspace)
+        search_path = _resolve_path(path, context)
     except PermissionError as e:
         return json.dumps({"error": str(e), "blocked": True})
     if not search_path.exists():
@@ -150,12 +141,11 @@ def patch_handler(
     old_string: str,
     new_string: str,
     replace_all: bool = False,
-    workspace: str | None = None,
-    allow_outside_workspace: bool = False,
+    context: ToolContext | None = None,
 ) -> str:
     """在文件中查找替换"""
     try:
-        filepath = _resolve_path(path, workspace, allow_outside_workspace)
+        filepath = _resolve_path(path, context)
     except PermissionError as e:
         return json.dumps({"error": str(e), "blocked": True})
     if not filepath.exists():

@@ -1,14 +1,13 @@
 """核心 牛马，其他的牛马都是这个牛马来的 — 工具调用 + LLM 交互 + 上下文管理"""
 
 import json
-import os
-import asyncio
 from typing import Any
 
 from .llm import LLMClient, create_client
 from .refusal import build_refusal_review_messages, is_refusal
 from .storage import ConversationStore
-from tools import registry
+from .state import AgentRunState, RunStatus
+from tools import ToolContext, registry
 from prompt import build_system_prompt
 from config import get_config, ConfigManager
 from utils import truncate_string
@@ -29,6 +28,8 @@ class Agent:
         self._total_tokens: int = 0
         self.session_id: str | None = None
         self.store: ConversationStore | None = None
+        self.tool_context: ToolContext | None = None
+        self.run_state = AgentRunState()
         self._init_store()
 
     def _init_store(self) -> None:
@@ -43,11 +44,7 @@ class Agent:
             mc = self.config.get_model_config()
             self.llm = create_client(mc)
         security = self.config.get_security_config()
-        registry.set_runtime_defaults({
-            "workspace": security.get("workspace_root", os.getcwd()),
-            "allow_outside_workspace": security.get("allow_outside_workspace", False),
-            "allow_terminal": security.get("allow_terminal", True),
-        })
+        self.tool_context = ToolContext.from_config(security, self.config.get_toolsets())
 
     def _init_refusal_llm(self) -> None:
         if self.refusal_llm is None:
@@ -158,13 +155,16 @@ class Agent:
         toolsets = self.config.get_toolsets()
         tool_schemas = registry.get_schemas(toolsets)
 
-        final_response_parts: list[str] = []
+        self.run_state = AgentRunState()
+        final_text = ""
 
-        request_turns = 0
-        hit_max_turns = True
-        while request_turns < max_turns:
-            request_turns += 1
+        for request_turn in range(1, max_turns + 1):
             self._turn_count += 1
+            self.run_state.transition(
+                RunStatus.WAITING_FOR_MODEL,
+                turn=request_turn,
+                total_turn=self._turn_count,
+            )
 
             # 上下文压缩检查
             estimated = self.llm.estimate_tokens(self._messages)
@@ -179,7 +179,12 @@ class Agent:
                 )
             except Exception as e:
                 error_msg = f"LLM call failed (turn {self._turn_count}): {e}"
-                final_response_parts.append(error_msg)
+                self.run_state.transition(
+                    RunStatus.FAILED,
+                    turn=request_turn,
+                    error=error_msg,
+                )
+                final_text = error_msg
                 break
 
             # 统计 token 使用
@@ -188,27 +193,26 @@ class Agent:
 
             finish_reason = self.llm.extract_finish_reason(response)
 
-            # 处理文本响应
             text = self.llm.extract_text(response)
-            if text:
-                final_response_parts.append(text)
-                # 如果 LLM 决定停止且不是 tool_call，返回
-                if finish_reason == "stop":
-                    self._messages.append({"role": "assistant", "content": text})
-                    self._persist_message("assistant", text)
-                    hit_max_turns = False
-                    break
-
-            # 处理工具调用
             tool_calls = self.llm.extract_tool_calls(response)
             if tool_calls:
+                self.run_state.transition(
+                    RunStatus.EXECUTING_TOOLS,
+                    turn=request_turn,
+                    tool_count=len(tool_calls),
+                )
                 assistant_msg = {
                     "role": "assistant",
-                    "content": text,
+                    "content": text or "",
                     "tool_calls": tool_calls,
                 }
+                if response.get("provider_items"):
+                    assistant_msg["provider_items"] = response["provider_items"]
                 self._messages.append(assistant_msg)
-                self._persist_message("assistant", text, metadata={"tool_calls": tool_calls})
+                metadata = {"tool_calls": tool_calls}
+                if response.get("provider_items"):
+                    metadata["provider_items"] = response["provider_items"]
+                self._persist_message("assistant", text, metadata=metadata)
 
                 for tc in tool_calls:
                     func = tc.get("function", {})
@@ -218,10 +222,19 @@ class Agent:
                     try:
                         tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
                     except json.JSONDecodeError:
-                        tool_args = {}
+                        tool_args = None
 
                     # 执行工具（支持 async handler）
-                    tool_result = await registry.dispatch_async(tool_name, tool_args)
+                    if tool_args is None:
+                        tool_result = json.dumps({"error": "Tool arguments are not valid JSON"})
+                        persisted_args = {"_raw": tool_args_str}
+                    else:
+                        tool_result = await registry.dispatch_async(
+                            tool_name,
+                            tool_args,
+                            context=self.tool_context,
+                        )
+                        persisted_args = tool_args if isinstance(tool_args, dict) else {"_raw": tool_args}
                     tool_result = truncate_string(tool_result, MAX_TOOL_RESULT_CHARS)
 
                     tool_msg = {
@@ -231,32 +244,41 @@ class Agent:
                     }
                     self._messages.append(tool_msg)
                     self._persist_message("tool", tool_result, tool_call_id=tc.get("id", ""))
-                    self._persist_tool_call(tool_name, tool_args, tool_result)
+                    self._persist_tool_call(tool_name, persisted_args, tool_result)
 
                     # 日志（如果配置开启了）
                     if self.config.get("display", "show_tool_calls"):
-                        self._log_tool_call(tool_name, tool_args, tool_result)
+                        self._log_tool_call(tool_name, persisted_args, tool_result)
 
                 # 继续下一轮
                 continue
 
-            # 无工具调用且 finish_reason 不是 stop — 将助手消息加入历史
             if text:
                 self._messages.append({"role": "assistant", "content": text})
                 self._persist_message("assistant", text)
+                if stream_callback:
+                    stream_callback(text)
 
-            # 如果 finish_reason 是 stop 或 length，退出
-            if finish_reason in ("stop", "length"):
-                hit_max_turns = False
+            if text:
+                final_text = text
+                self.run_state.transition(
+                    RunStatus.COMPLETED,
+                    turn=request_turn,
+                    finish_reason=finish_reason,
+                )
                 break
-
-        # 达到 max_turns
-        if hit_max_turns:
-            final_response_parts.append(
-                f"\n\n[Agent reached maximum turns ({max_turns}). Task may be incomplete.]"
+            error_msg = "Model returned neither text nor tool calls"
+            self.run_state.transition(
+                RunStatus.FAILED,
+                turn=request_turn,
+                error=error_msg,
             )
+            final_text = error_msg
+            break
+        else:
+            self.run_state.transition(RunStatus.MAX_TURNS, turn=max_turns)
+            final_text = f"[Agent reached maximum turns ({max_turns}). Task may be incomplete.]"
 
-        final_text = "\n".join(final_response_parts)
         return await self._review_refusal_if_needed(prompt, final_text)
 
     def _compress_context(self) -> None:
@@ -342,3 +364,6 @@ class Agent:
     def get_messages(self) -> list[dict]:
         """获取当前消息历史"""
         return list(self._messages)
+
+    def get_run_state(self) -> AgentRunState:
+        return self.run_state

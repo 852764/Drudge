@@ -5,6 +5,8 @@ import asyncio
 import inspect
 from typing import Any, Callable
 
+from .context import ToolContext
+
 # JSON Schema property types
 JSON_TYPE_MAP = {
     str: "string",
@@ -19,21 +21,12 @@ JSON_TYPE_MAP = {
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, dict] = {}  # name -> {schema, handler, toolset, check_fn, is_async}
-        self._runtime_defaults: dict[str, Any] = {}
 
-    def set_runtime_defaults(self, defaults: dict[str, Any]) -> None:
-        self._runtime_defaults = dict(defaults)
-
-    def _merge_args(self, args: dict, handler: Callable) -> dict:
-        merged = dict(args or {})
-        signature = inspect.signature(handler)
-        accepts_kwargs = any(
-            param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in signature.parameters.values()
-        )
-        for key, value in self._runtime_defaults.items():
-            if accepts_kwargs or key in signature.parameters:
-                merged.setdefault(key, value)
+    @staticmethod
+    def _handler_args(args: dict, handler: Callable, context: ToolContext) -> dict:
+        merged = dict(args)
+        if "context" in inspect.signature(handler).parameters:
+            merged["context"] = context
         return merged
 
     def register(
@@ -68,6 +61,7 @@ class ToolRegistry:
                     "type": "object",
                     "properties": properties,
                     "required": required or list(parameters.keys()),
+                    "additionalProperties": False,
                 },
             },
         }
@@ -78,6 +72,11 @@ class ToolRegistry:
             "toolset": toolset,
             "check_fn": check_fn,
             "is_async": inspect.iscoroutinefunction(handler),
+            "parameter_types": {
+                param_name: param_info.get("type", str)
+                for param_name, param_info in parameters.items()
+            },
+            "required": set(required or list(parameters.keys())),
         }
 
     def get_schemas(self, toolsets: list[str] | None = None) -> list[dict]:
@@ -97,36 +96,83 @@ class ToolRegistry:
             return json.dumps(result, ensure_ascii=False)
         return str(result)
 
-    def dispatch(self, tool_name: str, args: dict) -> str:
-        """执行工具调用（同步），返回 JSON 字符串"""
+    def _prepare_call(
+        self,
+        tool_name: str,
+        args: dict,
+        context: ToolContext | None,
+    ) -> tuple[dict, dict] | str:
         if tool_name not in self._tools:
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
+        if context is None:
+            return json.dumps({"error": "ToolContext is required", "blocked": True})
 
         info = self._tools[tool_name]
+        if not context.allows_toolset(info["toolset"]):
+            return json.dumps({
+                "error": f"Tool is disabled for this run: {tool_name}",
+                "blocked": True,
+            })
+        if not isinstance(args, dict):
+            return json.dumps({"error": "Tool arguments must be a JSON object"})
+
+        allowed = set(info["parameter_types"])
+        unknown = sorted(set(args) - allowed)
+        if unknown:
+            return json.dumps({
+                "error": f"Unknown tool arguments: {', '.join(unknown)}",
+                "blocked": True,
+            })
+        missing = sorted(info["required"] - set(args))
+        if missing:
+            return json.dumps({"error": f"Missing required arguments: {', '.join(missing)}"})
+
+        for name, value in args.items():
+            expected = info["parameter_types"][name]
+            valid = isinstance(value, expected)
+            if expected in (int, float) and isinstance(value, bool):
+                valid = False
+            if expected is float and isinstance(value, int) and not isinstance(value, bool):
+                valid = True
+            if not valid:
+                return json.dumps({
+                    "error": f"Invalid type for '{name}': expected {expected.__name__}"
+                })
+        return info, self._handler_args(args, info["handler"], context)
+
+    def dispatch(self, tool_name: str, args: dict, context: ToolContext | None = None) -> str:
+        """执行工具调用（同步），返回 JSON 字符串"""
+        prepared = self._prepare_call(tool_name, args, context)
+        if isinstance(prepared, str):
+            return prepared
+        info, call_args = prepared
         try:
             handler = info["handler"]
-            args = self._merge_args(args, handler)
             if info["is_async"]:
-                result = asyncio.run(handler(**args))
+                result = asyncio.run(handler(**call_args))
             else:
-                result = handler(**args)
+                result = handler(**call_args)
             return self._format_result(result)
         except Exception as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-    async def dispatch_async(self, tool_name: str, args: dict) -> str:
+    async def dispatch_async(
+        self,
+        tool_name: str,
+        args: dict,
+        context: ToolContext | None = None,
+    ) -> str:
         """执行工具调用（异步），用于 Agent 循环中 await async handler"""
-        if tool_name not in self._tools:
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
-
-        info = self._tools[tool_name]
+        prepared = self._prepare_call(tool_name, args, context)
+        if isinstance(prepared, str):
+            return prepared
+        info, call_args = prepared
         try:
             handler = info["handler"]
-            args = self._merge_args(args, handler)
             if info["is_async"]:
-                result = await handler(**args)
+                result = await handler(**call_args)
             else:
-                result = handler(**args)
+                result = await asyncio.to_thread(handler, **call_args)
             return self._format_result(result)
         except Exception as e:
             return json.dumps({"error": str(e)}, ensure_ascii=False)

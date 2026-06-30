@@ -2,8 +2,7 @@
 
 import json
 import subprocess
-import os
-from pathlib import Path
+from .context import ToolContext
 from .registry import registry
 
 
@@ -11,13 +10,13 @@ def terminal_handler(
     command: str,
     timeout: int = 180,
     workdir: str | None = None,
-    workspace: str | None = None,
-    allow_outside_workspace: bool = False,
-    allow_terminal: bool = True,
+    context: ToolContext | None = None,
 ) -> str:
     """执行 shell 命令"""
     # 安全检查：危险命令警告
-    if not allow_terminal:
+    if context is None:
+        return json.dumps({"error": "ToolContext is required", "blocked": True})
+    if not context.allow_terminal:
         return json.dumps({"error": "Terminal tool is disabled by config", "blocked": True})
 
     dangerous_patterns = ["rm -rf /", "mkfs.", "dd if=", ":(){ :|:& };:"]
@@ -29,14 +28,7 @@ def terminal_handler(
             })
 
     try:
-        cwd = Path(workdir or workspace or os.getcwd()).expanduser().resolve()
-        if workspace and not allow_outside_workspace:
-            workspace_root = Path(workspace).expanduser().resolve()
-            if cwd != workspace_root and workspace_root not in cwd.parents:
-                return json.dumps({
-                    "error": f"Workdir outside workspace is blocked: {cwd}",
-                    "blocked": True,
-                })
+        cwd = context.resolve_path(workdir or ".")
 
         if os.name == "nt":
             shell_cmd = ["cmd.exe", "/c", command]

@@ -5,10 +5,38 @@ import asyncio
 import argparse
 
 from agent import Agent
-from config import get_config
+from agent.llm import create_client
+from config import ConfigManager, get_config
 
 
 VERSION = "0.1.0"
+
+
+def _validate_runtime_config(config) -> None:
+    if config.get("model", "auth_mode") == "codex_oauth":
+        from agent.codex_auth import auth_status
+
+        if not auth_status().get("authenticated"):
+            print(
+                "Codex OAuth is not configured. Run: drudge auth login",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return
+    headers = config.get("model", "headers", default={}) or {}
+    auth_header_names = {"authorization", "proxy-authorization", "x-api-key"}
+    has_auth_header = any(str(name).lower() in auth_header_names for name in headers)
+    if (
+        not config.get("model", "api_key")
+        and not config.get("model", "allow_unauthenticated", default=False)
+        and not has_auth_header
+    ):
+        env_name = config.get("model", "api_key_env", default="OPENAI_API_KEY or DRUDGE_API_KEY")
+        print(
+            f"Missing API key. Set {env_name}, or provide model.api_key in your config file.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +55,18 @@ def parse_args() -> argparse.Namespace:
         help="Path to config file",
     )
     parser.add_argument(
+        "--codex-config",
+        nargs="?",
+        const=str(ConfigManager.default_codex_config_path()),
+        metavar="PATH",
+        help="Load model/provider settings from Codex config.toml (default: ~/.codex/config.toml)",
+    )
+    parser.add_argument(
+        "--codex-oauth",
+        action="store_true",
+        help="Use experimental direct ChatGPT Codex OAuth provider",
+    )
+    parser.add_argument(
         "-m", "--model",
         type=str,
         help="Model name override",
@@ -35,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         "-t", "--toolsets",
         type=str,
         help="Comma-separated toolsets (default: terminal,file,web)",
+    )
+    parser.add_argument(
+        "--no-tools",
+        action="store_true",
+        help="Disable tool schemas for this run",
     )
     parser.add_argument(
         "--version", "-V",
@@ -46,6 +91,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Verbose output",
     )
+    parser.add_argument(
+        "--models",
+        action="store_true",
+        help="List models from the configured provider",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    auth_parser = subparsers.add_parser("auth", help="Manage Drudge Codex OAuth credentials")
+    auth_parser.add_argument("action", choices=("login", "status", "logout"))
+    auth_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Print the login URL without opening a browser",
+    )
     return parser.parse_args()
 
 
@@ -54,18 +112,28 @@ async def run_query(
     config_path: str | None = None,
     toolsets: list[str] | None = None,
     model: str | None = None,
+    no_tools: bool = False,
+    codex_config_path: str | None = None,
+    codex_oauth: bool = False,
 ) -> None:
     """执行单次查询"""
-    config = get_config(config_path)
-    agent = Agent(config)
+    config = get_config(config_path, codex_config_path)
 
     if toolsets:
         config.override("toolsets", value=toolsets)
+    if no_tools:
+        config.override("toolsets", value=[])
     if model:
         config.override("model", "name", value=model)
+    if codex_oauth:
+        config.enable_codex_oauth()
+    _validate_runtime_config(config)
+    agent = Agent(config)
 
     print(f"Drudge v{VERSION}")
     print(f"Model: {config.get('model', 'name')}")
+    if config.codex_config_path:
+        print(f"Codex config: {config.codex_config_path}")
     print(f"Toolsets: {', '.join(config.get_toolsets())}")
     print("-" * 60)
 
@@ -83,19 +151,63 @@ async def run_query(
         print(f"Session: {agent.session_id}")
 
 
-def run_interactive(config_path: str | None = None, model: str | None = None) -> None:
+async def show_models(
+    config_path: str | None = None,
+    model: str | None = None,
+    codex_config_path: str | None = None,
+    codex_oauth: bool = False,
+) -> None:
+    config = get_config(config_path, codex_config_path)
+    if codex_oauth:
+        raise RuntimeError("Model listing is not supported by the Codex OAuth provider")
+    if model:
+        config.override("model", "name", value=model)
+    _validate_runtime_config(config)
+    client = create_client(config.get_model_config())
+    print(f"Base URL: {config.get('model', 'base_url')}")
+    print(f"Model API: {config.get('model', 'api', default='auto')}")
+    try:
+        models = await client.list_models()
+    except Exception as e:
+        print(f"Failed to list models: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not models:
+        print("No models returned by provider.")
+        return
+    for item in models:
+        print(item)
+
+
+def run_interactive(
+    config_path: str | None = None,
+    model: str | None = None,
+    no_tools: bool = False,
+    codex_config_path: str | None = None,
+    codex_oauth: bool = False,
+) -> None:
     """交互式对话模式"""
     try:
         from prompt_toolkit import PromptSession
         from prompt_toolkit.styles import Style
     except ImportError:
         print("prompt_toolkit not installed. Install with: pip install prompt-toolkit")
-        _run_simple_interactive(config_path, model)
+        _run_simple_interactive(
+            config_path,
+            model,
+            no_tools,
+            codex_config_path,
+            codex_oauth,
+        )
         return
 
-    config = get_config(config_path)
+    config = get_config(config_path, codex_config_path)
     if model:
         config.override("model", "name", value=model)
+    if no_tools:
+        config.override("toolsets", value=[])
+    if codex_oauth:
+        config.enable_codex_oauth()
+    _validate_runtime_config(config)
     agent = Agent(config)
 
     style = Style.from_dict({
@@ -104,6 +216,8 @@ def run_interactive(config_path: str | None = None, model: str | None = None) ->
 
     print(f"Drudge v{VERSION}")
     print(f"Model: {config.get('model', 'name')} | Toolsets: {', '.join(config.get_toolsets())}")
+    if config.codex_config_path:
+        print(f"Codex config: {config.codex_config_path}")
     print("Type /quit to exit, /help for commands, /tools to list tools")
     print("-" * 60)
 
@@ -138,15 +252,28 @@ def run_interactive(config_path: str | None = None, model: str | None = None) ->
             break
 
 
-def _run_simple_interactive(config_path: str | None = None, model: str | None = None) -> None:
+def _run_simple_interactive(
+    config_path: str | None = None,
+    model: str | None = None,
+    no_tools: bool = False,
+    codex_config_path: str | None = None,
+    codex_oauth: bool = False,
+) -> None:
     """简单交互模式（不依赖 prompt_toolkit）"""
-    config = get_config(config_path)
+    config = get_config(config_path, codex_config_path)
     if model:
         config.override("model", "name", value=model)
+    if no_tools:
+        config.override("toolsets", value=[])
+    if codex_oauth:
+        config.enable_codex_oauth()
+    _validate_runtime_config(config)
     agent = Agent(config)
 
     print(f"Drudge v{VERSION}")
     print(f"Model: {config.get('model', 'name')}")
+    if config.codex_config_path:
+        print(f"Codex config: {config.codex_config_path}")
     print("Type /quit to exit")
     print("-" * 60)
 
@@ -191,6 +318,7 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         print("  /help               Show this help")
         print("  /tools              List available tools")
         print("  /config             Show current config")
+        print("  /models             List provider models")
         print("  /sessions           List saved sessions")
         print("  /history [id]       Show saved messages")
         print("  /clear              Clear screen")
@@ -203,7 +331,9 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
             print(f"  - {name}")
     elif command == "/config":
         import yaml
-        print(yaml.dump(config._config, default_flow_style=False, allow_unicode=True))
+        print(yaml.dump(config.as_safe_dict(), default_flow_style=False, allow_unicode=True))
+    elif command == "/models":
+        asyncio.run(show_models_from_config(config))
     elif command == "/sessions":
         _show_sessions(config)
     elif command == "/history":
@@ -227,6 +357,23 @@ def _get_store(config):
         print("Conversation storage is disabled.")
         return None
     return ConversationStore(storage_config.get("path", "~/.drudge/drudge.db"))
+
+
+async def show_models_from_config(config) -> None:
+    _validate_runtime_config(config)
+    client = create_client(config.get_model_config())
+    print(f"Base URL: {config.get('model', 'base_url')}")
+    print(f"Model API: {config.get('model', 'api', default='auto')}")
+    try:
+        models = await client.list_models()
+    except Exception as e:
+        print(f"Failed to list models: {e}", file=sys.stderr)
+        return
+    if not models:
+        print("No models returned by provider.")
+        return
+    for item in models:
+        print(item)
 
 
 def _show_sessions(config) -> None:
@@ -256,24 +403,71 @@ def _show_history(config, session_id: str) -> None:
         print(f"[{message['created_at']}] {message['role']}: {content}")
 
 
+def _handle_auth_action(action: str, no_browser: bool = False) -> None:
+    from agent.codex_auth import auth_status, login_device_code, logout
+
+    if action == "login":
+        credentials = login_device_code(open_browser=not no_browser)
+        print("Codex OAuth login successful.")
+        print(f"Account ID present: {bool(credentials.get('account_id'))}")
+        return
+    if action == "status":
+        status = auth_status()
+        print(f"Authenticated: {status.get('authenticated', False)}")
+        if status.get("authenticated"):
+            print(f"Refresh token: {status.get('has_refresh_token', False)}")
+            print(f"Account ID present: {status.get('account_id_present', False)}")
+            print(f"Store: {status.get('path')}")
+        return
+    if action == "logout":
+        print("Codex OAuth credentials removed." if logout() else "No Codex OAuth credentials found.")
+
+
 def main():
     args = parse_args()
+
+    if args.command == "auth":
+        _handle_auth_action(args.action, args.no_browser)
+        return
 
     if args.version:
         print(f"Drudge v{VERSION}")
         return
 
     # 工具集覆盖
+    if args.models:
+        asyncio.run(show_models(
+            args.config,
+            args.model,
+            args.codex_config,
+            args.codex_oauth,
+        ))
+        return
+
     toolsets = None
     if args.toolsets:
         toolsets = [t.strip() for t in args.toolsets.split(",")]
 
     if args.query:
         # 单次查询
-        asyncio.run(run_query(args.query, args.config, toolsets, args.model))
+        asyncio.run(run_query(
+            args.query,
+            config_path=args.config,
+            codex_config_path=args.codex_config,
+            toolsets=toolsets,
+            model=args.model,
+            no_tools=args.no_tools,
+            codex_oauth=args.codex_oauth,
+        ))
     else:
         # 交互模式
-        run_interactive(args.config, args.model)
+        run_interactive(
+            args.config,
+            args.model,
+            args.no_tools,
+            args.codex_config,
+            args.codex_oauth,
+        )
 
 
 if __name__ == "__main__":

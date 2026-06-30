@@ -5,9 +5,11 @@ Drudge 是一个轻量级终端 AI Agent 原型，目标是逐步演进成类似
 ## 当前能力
 
 - OpenAI-compatible Chat Completions 客户端
+- Responses API 与函数工具调用适配
 - 终端、文件、Web 三类工具注册
 - 单次查询与交互式 CLI
 - YAML 配置文件与环境变量配置
+- 不可变工具权限上下文和显式 Agent 运行状态
 
 ## 安装
 
@@ -52,6 +54,8 @@ drudge --version
 drudge --help
 drudge -q "列出当前目录文件"
 drudge -c config.yaml -m gpt-4o-mini
+drudge --codex-config -q "检查当前项目"
+drudge --codex-config C:\path\to\config.toml
 ```
 
 开发时也可以直接运行：
@@ -60,12 +64,17 @@ drudge -c config.yaml -m gpt-4o-mini
 python main.py --version
 python main.py --help
 ```
-## todo
-```
-1.先修改agent，如果出现 我不能帮你之类的 就调用另外的 修改返回
-2.修改配置文件，辅助的用便宜的
-3.增加mcp的适配
-4.增加一些tools和skills
-5.压缩以及选择加载tools和skills的配置，以及tools skills 的分类管理
 
+## 测试
+
+测试完全离线，不需要 API Key：
+
+```bash
+python -m unittest discover -s tests -v
 ```
+
+## 开发文档
+
+- [第一周实施说明](docs/WEEK1_IMPLEMENTATION.md)
+- [使用 Codex 配置](docs/CODEX_CONFIG.md)
+- [Drudge Codex OAuth](docs/CODEX_OAUTH.md)
