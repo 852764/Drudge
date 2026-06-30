@@ -31,3 +31,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.command, "auth")
         self.assertEqual(args.action, "login")
         self.assertTrue(args.no_browser)
+
+    def test_doctor_subcommand(self):
+        with patch("sys.argv", ["drudge", "--codex-oauth", "doctor"]):
+            args = parse_args()
+
+        self.assertEqual(args.command, "doctor")
+        self.assertTrue(args.codex_oauth)

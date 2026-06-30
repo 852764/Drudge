@@ -75,6 +75,59 @@ class ToolSecurityTests(unittest.TestCase):
             self.assertTrue(payload["blocked"])
             self.assertIn("disabled by config", payload["error"])
 
+    def test_tool_result_envelope_and_apply_patch(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            target = Path(workspace, "sample.txt")
+            target.write_text("hello old", encoding="utf-8")
+            context = ToolContext(Path(workspace).resolve(), frozenset({"file"}))
+
+            result = asyncio.run(registry.dispatch_async(
+                "apply_patch",
+                {"path": "sample.txt", "old_string": "old", "new_string": "new"},
+                context=context,
+            ))
+
+            payload = json.loads(result)
+            self.assertTrue(payload["ok"])
+            self.assertIsNone(payload["error"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "hello new")
+
+    def test_approval_never_blocks_mutation(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            context = ToolContext(
+                Path(workspace).resolve(),
+                frozenset({"file"}),
+                approval_mode="never",
+            )
+            result = asyncio.run(registry.dispatch_async(
+                "write_file",
+                {"path": "blocked.txt", "content": "nope"},
+                context=context,
+            ))
+
+            payload = json.loads(result)
+            self.assertFalse(payload["ok"])
+            self.assertTrue(payload["blocked"])
+            self.assertFalse(Path(workspace, "blocked.txt").exists())
+
+    def test_sensitive_auth_file_read_is_blocked(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            auth_dir = Path(workspace, ".drudge")
+            auth_dir.mkdir()
+            Path(auth_dir, "auth.json").write_text("secret", encoding="utf-8")
+            context = ToolContext(Path(workspace).resolve(), frozenset({"file"}))
+
+            result = asyncio.run(registry.dispatch_async(
+                "read_file",
+                {"path": ".drudge/auth.json"},
+                context=context,
+            ))
+
+            payload = json.loads(result)
+            self.assertFalse(payload["ok"])
+            self.assertTrue(payload["blocked"])
+            self.assertIn("credential", payload["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

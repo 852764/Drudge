@@ -8,6 +8,7 @@ def build_system_prompt(
     toolsets: list[str],
     memory_entries: list[str] | None = None,
     skills: list[str] | None = None,
+    repo_map: str | None = None,
 ) -> str:
     """组装 system prompt"""
     parts = []
@@ -20,6 +21,9 @@ def build_system_prompt(
 
     # 3. 工具使用说明
     parts.append(_tool_usage_instructions(toolsets))
+
+    if repo_map:
+        parts.append(_repo_map_section(repo_map))
 
     # 4. 注入防护说明
     parts.append(_injection_guard())
@@ -74,7 +78,14 @@ Tool usage rules:
 - Call tools directly when you need to take action.
 - Each tool call returns a result that you can use in your response.
 - If a tool call fails, examine the error and try an alternative approach.
+- Prefer apply_patch for source edits instead of rewriting whole files.
+- Tool results use a standard JSON envelope: ok, content, error, metadata, blocked.
 - For commands that might be dangerous (rm, delete, format), ask for confirmation first."""
+
+
+def _repo_map_section(repo_map: str) -> str:
+    return f"""REPOSITORY MAP:
+{repo_map}"""
 
 
 def _injection_guard() -> str:

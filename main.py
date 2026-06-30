@@ -3,6 +3,9 @@
 import sys
 import asyncio
 import argparse
+import os
+import subprocess
+from pathlib import Path
 
 from agent import Agent
 from agent.llm import create_client
@@ -104,6 +107,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the login URL without opening a browser",
     )
+    subparsers.add_parser("doctor", help="Check Drudge configuration, auth, tools, and workspace state")
     return parser.parse_args()
 
 
@@ -423,11 +427,101 @@ def _handle_auth_action(action: str, no_browser: bool = False) -> None:
         print("Codex OAuth credentials removed." if logout() else "No Codex OAuth credentials found.")
 
 
+def run_doctor(
+    config_path: str | None = None,
+    model: str | None = None,
+    no_tools: bool = False,
+    codex_config_path: str | None = None,
+    codex_oauth: bool = False,
+) -> None:
+    config = get_config(config_path, codex_config_path)
+    if model:
+        config.override("model", "name", value=model)
+    if no_tools:
+        config.override("toolsets", value=[])
+    if codex_oauth:
+        config.enable_codex_oauth()
+
+    print(f"Drudge v{VERSION} doctor")
+    print(f"Python: {sys.version.split()[0]}")
+    print(f"Executable: {sys.executable}")
+    print(f"CWD: {os.getcwd()}")
+    print(f"Model: {config.get('model', 'name')}")
+    print(f"Provider: {config.get('model', 'provider', default='openai-compatible')}")
+    print(f"Base URL: {config.get('model', 'base_url')}")
+    print(f"Model API: {config.get('model', 'api', default='auto')}")
+    print(f"Toolsets: {', '.join(config.get_toolsets()) or '(none)'}")
+
+    security = config.get_security_config()
+    workspace = Path(security.get("workspace_root") or os.getcwd()).expanduser().resolve()
+    print(f"Workspace: {workspace}")
+    print(f"Workspace exists: {workspace.exists()}")
+    print(f"Approval mode: {security.get('approval_mode', 'auto')}")
+    print(f"Terminal allowed: {security.get('allow_terminal', True)}")
+    print(f"Network allowed: {security.get('allow_network', True)}")
+
+    storage = config.get_storage_config()
+    print(f"Storage enabled: {storage.get('enabled', True)}")
+    if storage.get("enabled", True):
+        print(f"Storage path: {Path(storage.get('path', '~/.drudge/drudge.db')).expanduser()}")
+
+    if config.get("model", "auth_mode") == "codex_oauth":
+        from agent.codex_auth import auth_status
+
+        status = auth_status()
+        print(f"Codex OAuth authenticated: {status.get('authenticated', False)}")
+        print(f"Codex OAuth account id present: {status.get('account_id_present', False)}")
+        print(f"Codex OAuth store: {status.get('path', '(default)')}")
+    else:
+        headers = config.get("model", "headers", default={}) or {}
+        has_api_key = bool(config.get("model", "api_key"))
+        has_auth_header = any(str(name).lower() in {"authorization", "x-api-key"} for name in headers)
+        print(f"API credential present: {has_api_key or has_auth_header}")
+
+    from tools import registry
+
+    print("Tools:")
+    for name in sorted(registry.list_tools(config.get_toolsets())):
+        print(f"  - {name}")
+
+    git_summary = _git_status_summary(workspace)
+    if git_summary:
+        print("Git:")
+        for line in git_summary:
+            print(f"  {line}")
+
+
+def _git_status_summary(workspace: Path) -> list[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(workspace), "-c", f"safe.directory={workspace.as_posix()}", "status", "--short"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            shell=False,
+        )
+    except Exception as exc:
+        return [f"unavailable: {exc}"]
+    if result.returncode != 0:
+        return ["not a git repository or git status failed"]
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    return ["clean"] if not lines else [f"dirty files: {len(lines)}"] + lines[:10]
+
+
 def main():
     args = parse_args()
 
     if args.command == "auth":
         _handle_auth_action(args.action, args.no_browser)
+        return
+    if args.command == "doctor":
+        run_doctor(
+            args.config,
+            args.model,
+            args.no_tools,
+            args.codex_config,
+            args.codex_oauth,
+        )
         return
 
     if args.version:

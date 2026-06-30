@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from .context import ToolContext
 from .registry import registry
+from .result import ToolResult
 
 
 def _resolve_path(
@@ -17,6 +18,12 @@ def _resolve_path(
     return context.resolve_path(path)
 
 
+def _is_sensitive_path(path: Path) -> bool:
+    parts = {part.lower() for part in path.parts}
+    name = path.name.lower()
+    return name == "auth.json" and ({".drudge", ".codex"} & parts)
+
+
 def read_file_handler(
     path: str,
     offset: int = 1,
@@ -27,7 +34,9 @@ def read_file_handler(
     try:
         filepath = _resolve_path(path, context)
     except PermissionError as e:
-        return json.dumps({"error": str(e), "blocked": True})
+        return ToolResult.failure(str(e), blocked=True)
+    if _is_sensitive_path(filepath):
+        return ToolResult.failure("Reading credential files is blocked", blocked=True)
     if not filepath.exists():
         return json.dumps({"error": f"File not found: {filepath}"})
 
@@ -67,7 +76,12 @@ def write_file_handler(
     try:
         filepath = _resolve_path(path, context)
     except PermissionError as e:
-        return json.dumps({"error": str(e), "blocked": True})
+        return ToolResult.failure(str(e), blocked=True)
+    if context is None:
+        return ToolResult.failure("ToolContext is required", blocked=True)
+    allowed, reason = context.mutation_allowed(f"write_file {filepath}")
+    if not allowed:
+        return ToolResult.failure(reason or "Write blocked", blocked=True)
     try:
         filepath.parent.mkdir(parents=True, exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
@@ -92,7 +106,9 @@ def search_files_handler(
     try:
         search_path = _resolve_path(path, context)
     except PermissionError as e:
-        return json.dumps({"error": str(e), "blocked": True})
+        return ToolResult.failure(str(e), blocked=True)
+    if _is_sensitive_path(search_path):
+        return ToolResult.failure("Searching credential files is blocked", blocked=True)
     if not search_path.exists():
         return json.dumps({"error": f"Path not found: {search_path}"})
 
@@ -147,7 +163,14 @@ def patch_handler(
     try:
         filepath = _resolve_path(path, context)
     except PermissionError as e:
-        return json.dumps({"error": str(e), "blocked": True})
+        return ToolResult.failure(str(e), blocked=True)
+    if context is None:
+        return ToolResult.failure("ToolContext is required", blocked=True)
+    allowed, reason = context.mutation_allowed(f"patch {filepath}")
+    if not allowed:
+        return ToolResult.failure(reason or "Patch blocked", blocked=True)
+    if _is_sensitive_path(filepath):
+        return ToolResult.failure("Editing credential files is blocked", blocked=True)
     if not filepath.exists():
         return json.dumps({"error": f"File not found: {filepath}"})
 
@@ -177,6 +200,17 @@ def patch_handler(
         })
     except Exception as e:
         return json.dumps({"error": str(e)})
+
+
+def apply_patch_handler(
+    path: str,
+    old_string: str,
+    new_string: str,
+    replace_all: bool = False,
+    context: ToolContext | None = None,
+) -> str:
+    """First-class patch tool for targeted source edits."""
+    return patch_handler(path, old_string, new_string, replace_all, context)
 
 
 def file_check() -> bool:
@@ -237,6 +271,21 @@ registry.register(
         "replace_all": {"type": bool, "description": "Replace all occurrences (default: false)"},
     },
     handler=patch_handler,
+    toolset="file",
+    check_fn=file_check,
+    required=["path", "old_string", "new_string"],
+)
+
+registry.register(
+    name="apply_patch",
+    description="Apply a targeted text patch to one file by replacing an exact old_string with new_string. Prefer this for code edits.",
+    parameters={
+        "path": {"type": str, "description": "File path to edit"},
+        "old_string": {"type": str, "description": "Exact text to replace"},
+        "new_string": {"type": str, "description": "Replacement text"},
+        "replace_all": {"type": bool, "description": "Replace all occurrences (default: false)"},
+    },
+    handler=apply_patch_handler,
     toolset="file",
     check_fn=file_check,
     required=["path", "old_string", "new_string"],

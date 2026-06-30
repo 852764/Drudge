@@ -29,6 +29,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "agent": {
         "max_turns": 50,
         "compression_threshold": 0.80,
+        "compact_keep_recent": 8,
+        "repo_map_enabled": True,
+        "repo_map_max_files": 80,
         "refusal_review_enabled": True,
         "refusal_review_notice": "[Drudge] 检测到模型可能拒绝了请求，正在进行安全二次处理...",
     },
@@ -45,6 +48,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "allow_outside_workspace": False,
         "allow_terminal": True,
         "allow_network": True,
+        "approval_mode": os.getenv("DRUDGE_APPROVAL_MODE", "auto"),
     },
     "toolsets": ["terminal", "file", "web"],
 }

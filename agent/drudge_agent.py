@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from .llm import LLMClient, create_client
+from .context_manager import build_repo_map, compact_messages, summarize_messages
 from .refusal import build_refusal_review_messages, is_refusal
 from .storage import ConversationStore
 from .state import AgentRunState, RunStatus
@@ -62,7 +63,13 @@ class Agent:
     ) -> list[dict]:
         """构建初始消息列表"""
         toolsets = self.config.get_toolsets()
-        system_content = build_system_prompt(toolsets, memory_entries, skills)
+        repo_map = None
+        if self.config.get("agent", "repo_map_enabled", default=True):
+            repo_map = build_repo_map(
+                self.config.get("security", "workspace_root", default="."),
+                max_files=int(self.config.get("agent", "repo_map_max_files", default=80)),
+            )
+        system_content = build_system_prompt(toolsets, memory_entries, skills, repo_map=repo_map)
 
         return [
             {"role": "system", "content": system_content},
@@ -226,7 +233,12 @@ class Agent:
 
                     # 执行工具（支持 async handler）
                     if tool_args is None:
-                        tool_result = json.dumps({"error": "Tool arguments are not valid JSON"})
+                        tool_result = json.dumps({
+                            "ok": False,
+                            "content": "",
+                            "error": "Tool arguments are not valid JSON",
+                            "metadata": {},
+                        })
                         persisted_args = {"_raw": tool_args_str}
                     else:
                         tool_result = await registry.dispatch_async(
@@ -283,6 +295,10 @@ class Agent:
 
     def _compress_context(self) -> None:
         """压缩上下文：保留系统消息 + 最近 N 轮 + 会话摘要"""
+        keep_recent = int(self.config.get("agent", "compact_keep_recent", default=8))
+        self._messages = compact_messages(self._messages, keep_recent=keep_recent)
+        return
+
         system_msg = None
         later_messages = []
         keep_recent = 6  # 保留最近 6 条消息（3 轮）
@@ -318,6 +334,8 @@ class Agent:
         TODO(Phase 1): 当前实现仅做简单截断（前 200 字符），Phase 1 应改为调用
         LLM 做摘要压缩，以更好地保留对话语义信息。当前 MVP 实现已满足基本可用性。
         """
+        return summarize_messages(messages, max_items=10)
+
         parts = []
         for msg in messages:
             if msg["role"] == "user":

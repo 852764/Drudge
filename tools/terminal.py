@@ -1,9 +1,11 @@
 """Terminal 工具 — 执行 shell 命令"""
 
 import json
+import os
 import subprocess
 from .context import ToolContext
 from .registry import registry
+from .result import ToolResult
 
 
 def terminal_handler(
@@ -15,17 +17,18 @@ def terminal_handler(
     """执行 shell 命令"""
     # 安全检查：危险命令警告
     if context is None:
-        return json.dumps({"error": "ToolContext is required", "blocked": True})
-    if not context.allow_terminal:
-        return json.dumps({"error": "Terminal tool is disabled by config", "blocked": True})
+        return ToolResult.failure("ToolContext is required", blocked=True)
+    allowed, reason = context.terminal_allowed(command)
+    if not allowed:
+        return ToolResult.failure(reason or "Terminal command blocked", blocked=True)
 
     dangerous_patterns = ["rm -rf /", "mkfs.", "dd if=", ":(){ :|:& };:"]
     for pattern in dangerous_patterns:
         if pattern in command:
-            return json.dumps({
-                "error": f"Dangerous command detected: pattern '{pattern}' found. Command blocked.",
-                "blocked": True,
-            })
+            return ToolResult.failure(
+                f"Dangerous command detected: pattern '{pattern}' found. Command blocked.",
+                blocked=True,
+            )
 
     try:
         cwd = context.resolve_path(workdir or ".")

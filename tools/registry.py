@@ -6,6 +6,7 @@ import inspect
 from typing import Any, Callable
 
 from .context import ToolContext
+from .result import normalize_tool_result
 
 # JSON Schema property types
 JSON_TYPE_MAP = {
@@ -90,11 +91,7 @@ class ToolRegistry:
 
     def _format_result(self, result: Any) -> str:
         """将 handler 返回值格式化为 JSON 字符串"""
-        if isinstance(result, str):
-            return result
-        if isinstance(result, dict):
-            return json.dumps(result, ensure_ascii=False)
-        return str(result)
+        return normalize_tool_result(result)
 
     def _prepare_call(
         self,
@@ -103,29 +100,29 @@ class ToolRegistry:
         context: ToolContext | None,
     ) -> tuple[dict, dict] | str:
         if tool_name not in self._tools:
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+            return normalize_tool_result({"error": f"Unknown tool: {tool_name}"})
         if context is None:
-            return json.dumps({"error": "ToolContext is required", "blocked": True})
+            return normalize_tool_result({"error": "ToolContext is required", "blocked": True})
 
         info = self._tools[tool_name]
         if not context.allows_toolset(info["toolset"]):
-            return json.dumps({
+            return normalize_tool_result({
                 "error": f"Tool is disabled for this run: {tool_name}",
                 "blocked": True,
             })
         if not isinstance(args, dict):
-            return json.dumps({"error": "Tool arguments must be a JSON object"})
+            return normalize_tool_result({"error": "Tool arguments must be a JSON object"})
 
         allowed = set(info["parameter_types"])
         unknown = sorted(set(args) - allowed)
         if unknown:
-            return json.dumps({
+            return normalize_tool_result({
                 "error": f"Unknown tool arguments: {', '.join(unknown)}",
                 "blocked": True,
             })
         missing = sorted(info["required"] - set(args))
         if missing:
-            return json.dumps({"error": f"Missing required arguments: {', '.join(missing)}"})
+            return normalize_tool_result({"error": f"Missing required arguments: {', '.join(missing)}"})
 
         for name, value in args.items():
             expected = info["parameter_types"][name]
@@ -135,7 +132,7 @@ class ToolRegistry:
             if expected is float and isinstance(value, int) and not isinstance(value, bool):
                 valid = True
             if not valid:
-                return json.dumps({
+                return normalize_tool_result({
                     "error": f"Invalid type for '{name}': expected {expected.__name__}"
                 })
         return info, self._handler_args(args, info["handler"], context)
@@ -154,7 +151,7 @@ class ToolRegistry:
                 result = handler(**call_args)
             return self._format_result(result)
         except Exception as e:
-            return json.dumps({"error": str(e)}, ensure_ascii=False)
+            return normalize_tool_result({"error": str(e)})
 
     async def dispatch_async(
         self,
@@ -175,7 +172,7 @@ class ToolRegistry:
                 result = await asyncio.to_thread(handler, **call_args)
             return self._format_result(result)
         except Exception as e:
-            return json.dumps({"error": str(e)}, ensure_ascii=False)
+            return normalize_tool_result({"error": str(e)})
 
     def is_async_handler(self, tool_name: str) -> bool:
         """检测 handler 是否为 async function"""

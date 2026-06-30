@@ -1,0 +1,46 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from agent.context_manager import build_repo_map, compact_messages, summarize_messages
+
+
+class ContextManagerTests(unittest.TestCase):
+    def test_repo_map_excludes_private_dirs(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            Path(workspace, "agent.py").write_text("print('ok')", encoding="utf-8")
+            hidden = Path(workspace, ".drudge")
+            hidden.mkdir()
+            Path(hidden, "auth.json").write_text("secret", encoding="utf-8")
+
+            repo_map = build_repo_map(workspace)
+
+            self.assertIn("agent.py", repo_map)
+            self.assertNotIn("auth.json", repo_map)
+
+    def test_compact_messages_keeps_system_and_recent(self):
+        messages = [{"role": "system", "content": "sys"}]
+        for index in range(12):
+            messages.append({"role": "user", "content": f"question {index}"})
+
+        compacted = compact_messages(messages, keep_recent=4)
+
+        self.assertEqual(compacted[0]["role"], "system")
+        self.assertIn("Previous conversation summary", compacted[1]["content"])
+        self.assertEqual(len(compacted), 6)
+        self.assertEqual(compacted[-1]["content"], "question 11")
+
+    def test_summarize_messages_mentions_tool_errors(self):
+        summary = summarize_messages([
+            {"role": "user", "content": "please inspect"},
+            {"role": "tool", "content": '{"error":"failed"}'},
+        ])
+
+        self.assertIn("User:", summary)
+        self.assertIn("Tool error", summary)
+
+
+if __name__ == "__main__":
+    unittest.main()
