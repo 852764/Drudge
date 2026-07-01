@@ -43,9 +43,11 @@ class ConsoleApproval:
 class _StreamPrinter:
     def __init__(self) -> None:
         self.seen = False
+        self.parts: list[str] = []
 
     def __call__(self, delta: str) -> None:
         self.seen = True
+        self.parts.append(delta)
         print(delta, end="", flush=True)
 
 
@@ -54,6 +56,9 @@ async def _run_and_print(agent: Agent, query: str) -> str:
     response = await agent.run(query, stream_callback=printer)
     if printer.seen:
         print()
+        streamed = "".join(printer.parts).rstrip()
+        if response.strip() and not streamed.endswith(response.rstrip()):
+            print(response)
     else:
         print(response)
     return response
@@ -242,7 +247,10 @@ async def run_query(
 
     usage = agent.get_token_usage()
     if config.get("display", "show_cost"):
-        print(f"\n--- Tokens: {usage['total_tokens']} | Turns: {usage['turns']} ---")
+        print(
+            f"\n--- Tokens: {usage['total_tokens']} | Utility: {usage['utility_tokens']} "
+            f"| Turns: {usage['turns']} ---"
+        )
     if agent.session_id:
         print(f"Session: {agent.session_id}")
 
@@ -295,8 +303,13 @@ async def show_status(config, agent: Agent, *, as_json: bool = False) -> dict:
     print(f"Session: {local['session_id'] or '(new)'}")
     print(f"Run status: {local['run_status']}")
     print(f"Model: {local['model']} ({local['provider']}, {local['model_api']})")
+    utility_suffix = "configured" if local["utility_model_configured"] else "primary reused"
+    print(f"Utility model: {local['utility_model']} ({utility_suffix})")
     print(f"Turns: {local['turns']} | Messages: {local['message_count']}")
-    print(f"Tokens this process: {local['tokens_this_process']}")
+    print(
+        f"Tokens this process: {local['tokens_this_process']} "
+        f"(utility: {local['utility_tokens_this_process']})"
+    )
     if local["context_limit"]:
         used = local["context_used_percent"] or 0.0
         print(
@@ -428,7 +441,10 @@ def run_interactive(
 
             usage = agent.get_token_usage()
             if config.get("display", "show_cost"):
-                print(f"Tokens: {usage['total_tokens']} | Turns: {usage['turns']}")
+                print(
+                    f"Tokens: {usage['total_tokens']} | Utility: {usage['utility_tokens']} "
+                    f"| Turns: {usage['turns']}"
+                )
             if agent.session_id:
                 print(f"Session: {agent.session_id}")
 
@@ -494,7 +510,10 @@ def _run_simple_interactive(
                 continue
 
             usage = agent.get_token_usage()
-            print(f"\nTokens: {usage['total_tokens']} | Turns: {usage['turns']}")
+            print(
+                f"\nTokens: {usage['total_tokens']} | Utility: {usage['utility_tokens']} "
+                f"| Turns: {usage['turns']}"
+            )
             if agent.session_id:
                 print(f"Session: {agent.session_id}")
 
@@ -524,6 +543,7 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         print("  /sessions           List saved sessions")
         print("  /history [id]       Show saved messages")
         print("  /status             Show session, context, and account limits")
+        print("  /compact            Compact older conversation context")
         print("  /resume <id>        Resume a saved session")
         print("  /new                Start a new session")
         print("  /skills             List discovered skills")
@@ -557,6 +577,19 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
             print("Agent is unavailable.")
         else:
             asyncio.run(show_status(config, agent))
+    elif command == "/compact":
+        if agent is None:
+            print("Agent is unavailable.")
+        else:
+            result = asyncio.run(agent.compact_context())
+            print(
+                f"Context compacted: {result['before_messages']} -> {result['after_messages']} messages, "
+                f"~{result['before_tokens']} -> ~{result['after_tokens']} tokens "
+                f"(mode={result['mode']}, model={result.get('summary_model') or 'deterministic'}, "
+                f"summary_tokens={result['summary_tokens']})"
+            )
+            if result.get("fallback_reason"):
+                print(f"LLM summary failed; used deterministic fallback: {result['fallback_reason']}")
     elif command == "/resume":
         if agent is None:
             print("Agent is unavailable.")
@@ -733,6 +766,8 @@ def run_doctor(
     print(f"Executable: {sys.executable}")
     print(f"CWD: {os.getcwd()}")
     print(f"Model: {config.get('model', 'name')}")
+    if config.has_utility_model():
+        print(f"Utility model: {config.get_utility_model_config().get('name')}")
     print(f"Provider: {config.get('model', 'provider', default='openai-compatible')}")
     print(f"Base URL: {config.get('model', 'base_url')}")
     print(f"Model API: {config.get('model', 'api', default='auto')}")

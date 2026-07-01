@@ -7,7 +7,19 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from .llm import LLMClient, create_client
-from .context_manager import build_repo_map, compact_messages, summarize_messages
+from .output_filter import (
+    DegenerateReasoningError,
+    ReasoningTagFilter,
+    filter_reasoning_text,
+    sanitize_provider_items,
+)
+from .context_manager import (
+    build_compacted_messages,
+    build_context_summary_messages,
+    build_repo_map,
+    partition_messages_for_compaction,
+    summarize_messages,
+)
 from .refusal import build_refusal_review_messages, is_refusal
 from .storage import ConversationStore
 from .project_instructions import load_project_instructions, render_project_instructions
@@ -41,10 +53,12 @@ class Agent:
     ):
         self.config = config or get_config()
         self.llm: LLMClient | None = None
+        self.utility_llm: LLMClient | None = None
         self.refusal_llm: LLMClient | None = None
         self._messages: list[dict] = []
         self._turn_count: int = 0
         self._total_tokens: int = 0
+        self._utility_tokens: int = 0
         self.session_id: str | None = None
         self.store: ConversationStore | None = None
         self.tool_context: ToolContext | None = None
@@ -53,6 +67,7 @@ class Agent:
         self._session_approvals: set[tuple[str, str]] = set()
         self._cancel_event = asyncio.Event()
         self._active_task: asyncio.Task | None = None
+        self._last_compaction: dict[str, Any] | None = None
         workspace = self.config.get("security", "workspace_root", default=".")
         self.skill_manager = SkillManager(
             workspace,
@@ -74,6 +89,114 @@ class Agent:
         result = callback(text)
         if inspect.isawaitable(result):
             await result
+
+    async def _call_model_filtered(
+        self,
+        tool_schemas: list[dict],
+        stream_callback: Any,
+    ) -> tuple[dict, str | None, list[dict], bool, bool, int]:
+        hide_reasoning = bool(
+            self.config.get("display", "hide_reasoning_tags", default=True)
+        )
+        max_reasoning_chars = int(
+            self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
+        )
+        recovery_attempts = max(
+            0,
+            int(self.config.get("agent", "reasoning_recovery_attempts", default=1)),
+        )
+        total_tokens = 0
+        last_result: tuple[dict, str | None, list[dict], bool, bool, int] | None = None
+
+        for attempt in range(recovery_attempts + 1):
+            parser = ReasoningTagFilter(max_reasoning_chars=max_reasoning_chars)
+            turn_streamed = False
+
+            async def emit_delta(delta: str) -> None:
+                nonlocal turn_streamed
+                visible = parser.feed(delta) if hide_reasoning else delta
+                if not visible:
+                    return
+                turn_streamed = True
+                await self._emit(stream_callback, visible)
+
+            request_messages = (
+                self._reasoning_recovery_messages(self._messages)
+                if attempt > 0
+                else self._messages
+            )
+            try:
+                response = await self.llm.chat(
+                    request_messages,
+                    tools=tool_schemas if tool_schemas else None,
+                    stream_callback=emit_delta if stream_callback else None,
+                    cancel_event=self._cancel_event,
+                )
+                if stream_callback and hide_reasoning:
+                    tail = parser.finish()
+                    if tail:
+                        turn_streamed = True
+                        await self._emit(stream_callback, tail)
+            except DegenerateReasoningError:
+                if attempt < recovery_attempts and not "".join(parser.visible_parts).strip():
+                    await self._compress_context()
+                    continue
+                raise
+
+            usage = response.get("usage", {})
+            total_tokens += int(usage.get("total_tokens", 0) or 0)
+            raw_text = self.llm.extract_text(response)
+            filtered = (
+                filter_reasoning_text(
+                    raw_text or "",
+                    max_reasoning_chars=max_reasoning_chars,
+                )
+                if hide_reasoning and raw_text
+                else None
+            )
+            text = filtered.text if filtered is not None else raw_text
+            tool_calls = self.llm.extract_tool_calls(response)
+            if hide_reasoning and response.get("provider_items"):
+                response["provider_items"] = sanitize_provider_items(
+                    response["provider_items"],
+                    max_reasoning_chars=max_reasoning_chars,
+                )
+            reasoning_only = bool(
+                filtered
+                and filtered.saw_tag
+                and not (text or "").strip()
+                and not tool_calls
+            )
+            last_result = (
+                response,
+                text,
+                tool_calls,
+                turn_streamed,
+                reasoning_only,
+                total_tokens,
+            )
+            if reasoning_only and attempt < recovery_attempts:
+                await self._compress_context()
+                continue
+            return last_result
+
+        if last_result is not None:
+            return last_result
+        raise RuntimeError("Model reasoning recovery failed without a response")
+
+    @staticmethod
+    def _reasoning_recovery_messages(messages: list[dict]) -> list[dict]:
+        requirement = (
+            "OUTPUT REQUIREMENT: Give the final answer directly. Do not emit <think> tags, "
+            "hidden chain-of-thought, or a reasoning transcript. Keep internal reasoning private."
+        )
+        recovered = [dict(message) for message in messages]
+        for index, message in enumerate(recovered):
+            if message.get("role") == "system":
+                content = str(message.get("content") or "")
+                recovered[index] = {**message, "content": f"{content}\n\n{requirement}"}
+                return recovered
+        return [{"role": "system", "content": requirement}] + recovered
 
     async def _approve_tool(self, tool_name: str, args: dict) -> bool:
         if not self.tool_context or self.tool_context.approval_mode != "on_request":
@@ -162,6 +285,8 @@ class Agent:
         self.session_id = None
         self._turn_count = 0
         self._total_tokens = 0
+        self._utility_tokens = 0
+        self._last_compaction = None
         self._session_approvals.clear()
         self.run_state = AgentRunState()
         if clear_skills:
@@ -186,9 +311,12 @@ class Agent:
         ]
         self.session_id = session_id
         self._messages = [self._restore_message(row) for row in rows]
+        self._sanitize_historical_reasoning()
         assistant_turns = sum(1 for message in self._messages if message.get("role") == "assistant")
         self._turn_count = max(self.store.get_max_turn(session_id), assistant_turns)
         self._total_tokens = 0
+        self._utility_tokens = 0
+        self._last_compaction = None
         self._session_approvals.clear()
         repaired = self._repair_incomplete_tool_transactions()
         self._refresh_system_message()
@@ -197,6 +325,26 @@ class Agent:
         result["repaired_tool_calls"] = repaired
         result["active_skills"] = list(self.active_skill_names)
         return result
+
+    def _sanitize_historical_reasoning(self) -> None:
+        if not self.config.get("display", "hide_reasoning_tags", default=True):
+            return
+        max_chars = int(
+            self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
+        )
+        for message in self._messages:
+            if message.get("role") != "assistant":
+                continue
+            if isinstance(message.get("content"), str):
+                message["content"] = filter_reasoning_text(
+                    message["content"],
+                    max_reasoning_chars=max_chars,
+                ).text
+            if message.get("provider_items"):
+                message["provider_items"] = sanitize_provider_items(
+                    message["provider_items"],
+                    max_reasoning_chars=max_chars,
+                )
 
     @staticmethod
     def _restore_message(row: dict[str, Any]) -> dict[str, Any]:
@@ -249,6 +397,15 @@ class Agent:
             if isinstance(review_config, dict):
                 mc.update(review_config)
             self.refusal_llm = create_client(mc)
+
+    def _get_utility_llm(self) -> LLMClient:
+        """Return the configured low-cost client, or reuse the primary client."""
+        self._init_llm()
+        if not self.config.has_utility_model():
+            return self.llm
+        if self.utility_llm is None:
+            self.utility_llm = create_client(self.config.get_utility_model_config())
+        return self.utility_llm
 
     def _build_initial_messages(
         self,
@@ -431,32 +588,37 @@ class Agent:
                 total_turn=self._turn_count,
             )
 
-            # 上下文压缩检查
-            estimated = self.llm.estimate_tokens(self._messages)
-            context_limit = self.config.get("model", "context_length")
-            if estimated > context_limit * compression_threshold:
-                self._compress_context()
-
-            turn_streamed = False
-
-            async def emit_delta(delta: str) -> None:
-                nonlocal turn_streamed
-                if not delta:
-                    return
-                turn_streamed = True
-                await self._emit(stream_callback, delta)
-
             try:
-                response = await self.llm.chat(
-                    self._messages,
-                    tools=tool_schemas if tool_schemas else None,
-                    stream_callback=emit_delta if stream_callback else None,
-                    cancel_event=self._cancel_event,
+                # 上下文压缩和正常回答共享取消、失败状态处理。
+                estimated = self.llm.estimate_tokens(self._messages)
+                context_limit = self.config.get("model", "context_length")
+                if estimated > context_limit * compression_threshold:
+                    await self._compress_context()
+
+                (
+                    response,
+                    text,
+                    tool_calls,
+                    turn_streamed,
+                    reasoning_only,
+                    attempt_tokens,
+                ) = await self._call_model_filtered(
+                    tool_schemas,
+                    stream_callback,
                 )
             except asyncio.CancelledError:
                 self.run_state.transition(RunStatus.CANCELLED, turn=request_turn)
                 self._active_task = None
                 raise
+            except DegenerateReasoningError as e:
+                error_msg = f"Model reasoning stream was stopped: {e}"
+                self.run_state.transition(
+                    RunStatus.FAILED,
+                    turn=request_turn,
+                    error=error_msg,
+                )
+                final_text = error_msg
+                break
             except Exception as e:
                 error_msg = f"LLM call failed (turn {self._turn_count}): {e}"
                 self.run_state.transition(
@@ -468,13 +630,22 @@ class Agent:
                 break
 
             # 统计 token 使用
-            usage = response.get("usage", {})
-            self._total_tokens += usage.get("total_tokens", 0)
+            self._total_tokens += attempt_tokens
 
             finish_reason = self.llm.extract_finish_reason(response)
-
-            text = self.llm.extract_text(response)
-            tool_calls = self.llm.extract_tool_calls(response)
+            if reasoning_only:
+                error_msg = (
+                    "Model returned only <think> reasoning and no final answer, "
+                    "including after the configured recovery attempts. "
+                    "Try /compact, /new, or a shorter prompt."
+                )
+                self.run_state.transition(
+                    RunStatus.FAILED,
+                    turn=request_turn,
+                    error=error_msg,
+                )
+                final_text = error_msg
+                break
             if tool_calls:
                 self.run_state.transition(
                     RunStatus.EXECUTING_TOOLS,
@@ -605,66 +776,93 @@ class Agent:
         self._active_task = None
         return reviewed
 
-    def _compress_context(self) -> None:
-        """压缩上下文：保留系统消息 + 最近 N 轮 + 会话摘要"""
+    async def _compress_context(self) -> dict[str, Any]:
+        """Compact old context with an LLM summary and a deterministic fallback."""
         keep_recent = int(self.config.get("agent", "compact_keep_recent", default=8))
-        self._messages = compact_messages(self._messages, keep_recent=keep_recent)
-        return
+        system_messages, old_messages, recent_messages = partition_messages_for_compaction(
+            self._messages,
+            keep_recent=keep_recent,
+        )
+        if not old_messages:
+            result = {
+                "mode": "not_needed",
+                "summarized_messages": 0,
+                "summary_tokens": 0,
+            }
+            self._last_compaction = result
+            return result
 
-        system_msg = None
-        later_messages = []
-        keep_recent = 6  # 保留最近 6 条消息（3 轮）
+        configured_mode = str(
+            self.config.get("agent", "context_summary_mode", default="llm")
+        ).strip().lower()
+        fallback_enabled = bool(
+            self.config.get("agent", "context_summary_fallback", default=True)
+        )
+        summary_tokens = 0
+        summary_model: str | None = None
+        error: str | None = None
 
-        for msg in self._messages:
-            if msg["role"] == "system":
-                system_msg = msg
-            else:
-                later_messages.append(msg)
+        if configured_mode == "llm":
+            try:
+                summary_llm = self._get_utility_llm()
+                summary_model = summary_llm.model
+                response = await summary_llm.chat(
+                    build_context_summary_messages(old_messages),
+                    tools=None,
+                    cancel_event=self._cancel_event,
+                )
+                usage = response.get("usage", {})
+                summary_tokens = int(usage.get("total_tokens", 0) or 0)
+                raw_summary = summary_llm.extract_text(response) or ""
+                filtered = filter_reasoning_text(
+                    raw_summary,
+                    max_reasoning_chars=int(
+                        self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
+                    ),
+                )
+                summary = filtered.text.strip()
+                if not summary:
+                    raise RuntimeError("context summary model returned no visible text")
+                mode = "llm"
+            except Exception as exc:
+                if not fallback_enabled:
+                    raise
+                error = str(exc)
+                summary = summarize_messages(old_messages)
+                mode = "fallback"
+        else:
+            summary = summarize_messages(old_messages)
+            mode = "fallback"
 
-        if len(later_messages) <= keep_recent:
-            return
-
-        # 保留系统消息 + 最近的消息
-        recent = later_messages[-keep_recent:]
-        old_messages = later_messages[:-keep_recent]
-
-        # 摘要旧消息
-        summary = self._summarize_messages(old_messages)
-        summary_msg = {
-            "role": "user",
-            "content": f"[Previous conversation summary]\n{summary}\n[End summary]",
+        self._total_tokens += summary_tokens
+        self._utility_tokens += summary_tokens
+        self._messages = build_compacted_messages(
+            system_messages,
+            summary,
+            recent_messages,
+        )
+        result = {
+            "mode": mode,
+            "summarized_messages": len(old_messages),
+            "summary_tokens": summary_tokens,
+            "summary_model": summary_model,
         }
+        if error:
+            result["fallback_reason"] = error
+        self._last_compaction = result
+        return result
 
-        new_messages = [system_msg] if system_msg else []
-        new_messages.append(summary_msg)
-        new_messages.extend(recent)
-        self._messages = new_messages
-
-    def _summarize_messages(self, messages: list[dict]) -> str:
-        """简单摘要：提取关键信息。
-
-        TODO(Phase 1): 当前实现仅做简单截断（前 200 字符），Phase 1 应改为调用
-        LLM 做摘要压缩，以更好地保留对话语义信息。当前 MVP 实现已满足基本可用性。
-        """
-        return summarize_messages(messages, max_items=10)
-
-        parts = []
-        for msg in messages:
-            if msg["role"] == "user":
-                content = msg.get("content", "")
-                if content and len(content) > 20:
-                    parts.append(f"User asked: {content[:200]}")
-            elif msg["role"] == "assistant":
-                content = msg.get("content", "")
-                if content:
-                    parts.append(f"Agent responded: {content[:200]}")
-            elif msg["role"] == "tool":
-                content = msg.get("content", "")
-                if "error" in content.lower():
-                    parts.append(f"Tool error: {content[:100]}")
-                else:
-                    parts.append("Tool result received")
-        return "\n".join(parts[:10])
+    async def compact_context(self) -> dict[str, Any]:
+        before_messages = len(self._messages)
+        before_tokens = LLMClient.estimate_tokens(self._messages)
+        details = await self._compress_context()
+        return {
+            "before_messages": before_messages,
+            "after_messages": len(self._messages),
+            "before_tokens": before_tokens,
+            "after_tokens": LLMClient.estimate_tokens(self._messages),
+            **details,
+        }
 
     def _log_tool_call(self, name: str, args: dict, result: str) -> None:
         """记录工具调用（彩色输出）"""
@@ -688,6 +886,7 @@ class Agent:
         """获取 token 使用统计"""
         return {
             "total_tokens": self._total_tokens,
+            "utility_tokens": self._utility_tokens,
             "turns": self._turn_count,
         }
 
@@ -704,6 +903,9 @@ class Agent:
             "model_api": self.config.get("model", "api", default="auto"),
             "turns": self._turn_count,
             "tokens_this_process": self._total_tokens,
+            "utility_tokens_this_process": self._utility_tokens,
+            "utility_model": self.config.get_utility_model_config().get("name"),
+            "utility_model_configured": self.config.has_utility_model(),
             "message_count": len(self._messages),
             "estimated_context_tokens": estimated,
             "context_limit": context_limit,
@@ -713,6 +915,7 @@ class Agent:
             "active_skills": list(self.active_skill_names),
             "storage_enabled": bool(storage.get("enabled", True)),
             "storage_path": storage.get("path") if storage.get("enabled", True) else None,
+            "last_compaction": dict(self._last_compaction) if self._last_compaction else None,
         }
 
     def get_messages(self) -> list[dict]:

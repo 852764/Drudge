@@ -121,6 +121,47 @@ openai_base_url = "https://proxy.example/v1"
 
         self.assertIsInstance(client, CodexOAuthClient)
 
+    def test_utility_model_inherits_primary_provider_settings(self):
+        config = ConfigManager()
+        config.override("model", "name", value="primary-model")
+        config.override("model", "base_url", value="https://provider.example/v1")
+        config.override("model", "api_key", value="shared-secret")
+        config.override("utility_model", value={
+            "name": "cheap-model",
+            "temperature": 0.1,
+            "api_key_env": "UTILITY_TEST_API_KEY",
+        })
+
+        with patch.dict(os.environ, {"UTILITY_TEST_API_KEY": "utility-secret"}):
+            utility = config.get_utility_model_config()
+
+        self.assertTrue(config.has_utility_model())
+        self.assertEqual(utility["name"], "cheap-model")
+        self.assertEqual(utility["base_url"], "https://provider.example/v1")
+        self.assertEqual(utility["api_key"], "utility-secret")
+        self.assertEqual(utility["temperature"], 0.1)
+
+    def test_utility_model_can_override_codex_oauth_with_another_provider(self):
+        config = ConfigManager()
+        config.enable_codex_oauth()
+        config.override("utility_model", value={
+            "provider": "openai-compatible",
+            "name": "cheap-model",
+            "base_url": "https://cheap.example/v1",
+            "api_key": "cheap-secret",
+            "api": "chat",
+        })
+
+        client = create_client(config.get_utility_model_config())
+
+        self.assertNotIsInstance(client, CodexOAuthClient)
+        self.assertEqual(client.model, "cheap-model")
+        self.assertEqual(client.base_url, "https://cheap.example/v1")
+        self.assertEqual(
+            config.as_safe_dict()["utility_model"]["api_key"],
+            "***REDACTED***",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

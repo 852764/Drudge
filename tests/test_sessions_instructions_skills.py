@@ -89,6 +89,24 @@ class SessionInstructionSkillTests(unittest.TestCase):
             second_info = second.resume_session(session_id)
             self.assertEqual(second_info["repaired_tool_calls"], 0)
 
+    def test_resume_cleans_legacy_think_content(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            db_path = str(Path(workspace, "drudge.db"))
+            store = ConversationStore(db_path)
+            session_id = store.create_session("legacy think", "fake")
+            store.append_message(session_id, "system", "system")
+            store.append_message(session_id, "user", "question")
+            store.append_message(
+                session_id,
+                "assistant",
+                "<think>old private reasoning</think>old answer",
+            )
+
+            agent = Agent(configured(workspace, db_path))
+            agent.resume_session(session_id)
+
+            self.assertEqual(agent.get_messages()[-1]["content"], "old answer")
+
     def test_old_sqlite_schema_is_migrated(self):
         with tempfile.TemporaryDirectory() as workspace:
             db_path = Path(workspace, "legacy.db")

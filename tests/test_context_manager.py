@@ -4,7 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent.context_manager import build_repo_map, compact_messages, summarize_messages
+from agent.context_manager import (
+    build_context_summary_messages,
+    build_repo_map,
+    compact_messages,
+    summarize_messages,
+)
 
 
 class ContextManagerTests(unittest.TestCase):
@@ -64,6 +69,27 @@ class ContextManagerTests(unittest.TestCase):
         roles = [message["role"] for message in compacted]
         self.assertEqual(roles[-3:], ["assistant", "tool", "user"])
         self.assertEqual(compacted[-2]["tool_call_id"], "call-1")
+
+    def test_summary_request_keeps_tool_semantics_but_omits_provider_state(self):
+        request = build_context_summary_messages([
+            {
+                "role": "assistant",
+                "content": "checking",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+                }],
+                "provider_items": [{"type": "reasoning", "encrypted_content": "secret"}],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "file contents"},
+        ])
+
+        transcript = request[1]["content"]
+        self.assertIn("read_file", transcript)
+        self.assertIn("tool_call_id", transcript)
+        self.assertNotIn("provider_items", transcript)
+        self.assertNotIn("encrypted_content", transcript)
 
 
 if __name__ == "__main__":

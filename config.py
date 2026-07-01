@@ -26,22 +26,30 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "api": os.getenv("DRUDGE_MODEL_API", "auto"),
         "aliases": {},
     },
+    # Optional low-cost model for context summaries and other background tasks.
+    # Missing fields inherit from "model"; null means reuse the primary client.
+    "utility_model": None,
     "agent": {
         "max_turns": 50,
         "compression_threshold": 0.80,
         "compact_keep_recent": 8,
+        "context_summary_mode": "llm",
+        "context_summary_fallback": True,
         "repo_map_enabled": True,
         "repo_map_max_files": 80,
         "instructions_enabled": True,
         "instructions_filename": "AGENTS.md",
         "instructions_max_chars": 64000,
         "skill_max_chars": 32000,
+        "reasoning_tag_max_chars": 12000,
+        "reasoning_recovery_attempts": 1,
         "refusal_review_enabled": True,
         "refusal_review_notice": "[Drudge] 检测到模型可能拒绝了请求，正在进行安全二次处理...",
     },
     "display": {
         "show_cost": True,
         "show_tool_calls": True,
+        "hide_reasoning_tags": True,
     },
     "storage": {
         "enabled": True,
@@ -196,6 +204,22 @@ class ConfigManager:
 
     def get_model_config(self) -> dict[str, Any]:
         return self.get("model", default={})
+
+    def has_utility_model(self) -> bool:
+        return isinstance(self.get("utility_model", default=None), dict) and bool(
+            self.get("utility_model", default={})
+        )
+
+    def get_utility_model_config(self) -> dict[str, Any]:
+        """Return utility model settings overlaid on the primary model settings."""
+        merged = deepcopy(self.get_model_config())
+        override = self.get("utility_model", default=None)
+        if isinstance(override, dict):
+            self._deep_update(merged, override)
+        api_key_env = merged.get("api_key_env")
+        if api_key_env:
+            merged["api_key"] = os.getenv(str(api_key_env), merged.get("api_key", ""))
+        return merged
 
     def get_agent_config(self) -> dict[str, Any]:
         return self.get("agent", default={})

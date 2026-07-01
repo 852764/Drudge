@@ -82,3 +82,5 @@ python -m unittest discover -s tests -v
 - [审批、流式输出与取消](docs/APPROVAL_STREAMING.md)
 - [SQLite 会话恢复、AGENTS.md 与 Skills](docs/SESSIONS_AGENTS_SKILLS.md)
 - [Drudge 状态与 Codex 限额](docs/STATUS.md)
+- [`<think>` 刷屏与无最终答案防护](docs/THINK_OUTPUT_FIX.md)
+- [LLM 上下文摘要压缩](docs/LLM_CONTEXT_COMPACTION.md)
