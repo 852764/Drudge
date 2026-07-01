@@ -691,6 +691,30 @@ class Agent:
             "turns": self._turn_count,
         }
 
+    def get_status(self) -> dict[str, Any]:
+        estimated = LLMClient.estimate_tokens(self._messages)
+        context_limit = int(self.config.get("model", "context_length", default=0) or 0)
+        context_percent = (estimated / context_limit * 100) if context_limit else None
+        storage = self.config.get_storage_config()
+        return {
+            "session_id": self.session_id,
+            "run_status": self.run_state.status.value,
+            "model": self.config.get("model", "name", default="unknown"),
+            "provider": self.config.get("model", "provider", default="openai-compatible"),
+            "model_api": self.config.get("model", "api", default="auto"),
+            "turns": self._turn_count,
+            "tokens_this_process": self._total_tokens,
+            "message_count": len(self._messages),
+            "estimated_context_tokens": estimated,
+            "context_limit": context_limit,
+            "context_used_percent": context_percent,
+            "workspace": str(self.config.get("security", "workspace_root", default=".")),
+            "approval_mode": self.config.get("security", "approval_mode", default="auto"),
+            "active_skills": list(self.active_skill_names),
+            "storage_enabled": bool(storage.get("enabled", True)),
+            "storage_path": storage.get("path") if storage.get("enabled", True) else None,
+        }
+
     def get_messages(self) -> list[dict]:
         """获取当前消息历史"""
         return list(self._messages)

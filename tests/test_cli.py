@@ -54,3 +54,10 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(args.resume, "abc123")
         self.assertEqual(args.skill, ["review", "tests"])
+
+    def test_status_subcommand_json(self):
+        with patch("sys.argv", ["drudge", "--codex-oauth", "status", "--json"]):
+            args = parse_args()
+
+        self.assertEqual(args.command, "status")
+        self.assertTrue(args.status_json)

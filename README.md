@@ -81,3 +81,4 @@ python -m unittest discover -s tests -v
 - [Priority 1-3 Implementation Notes](docs/PRIORITY_1_2_3.md)
 - [审批、流式输出与取消](docs/APPROVAL_STREAMING.md)
 - [SQLite 会话恢复、AGENTS.md 与 Skills](docs/SESSIONS_AGENTS_SKILLS.md)
+- [Drudge 状态与 Codex 限额](docs/STATUS.md)

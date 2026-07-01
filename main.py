@@ -169,6 +169,13 @@ def parse_args() -> argparse.Namespace:
         help="Print the login URL without opening a browser",
     )
     subparsers.add_parser("doctor", help="Check Drudge configuration, auth, tools, and workspace state")
+    status_parser = subparsers.add_parser("status", help="Show session status and Codex limits")
+    status_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="status_json",
+        help="Print machine-readable status JSON",
+    )
     return parser.parse_args()
 
 
@@ -265,6 +272,81 @@ async def show_models(
         return
     for item in models:
         print(item)
+
+
+async def show_status(config, agent: Agent, *, as_json: bool = False) -> dict:
+    import json
+
+    result = {"local": agent.get_status(), "account_usage": None, "account_usage_error": None}
+    if config.get("model", "auth_mode") == "codex_oauth":
+        from agent.codex_usage import CodexUsageClient
+
+        try:
+            result["account_usage"] = await CodexUsageClient().fetch()
+        except Exception as exc:
+            result["account_usage_error"] = str(exc)
+
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return result
+
+    local = result["local"]
+    print("Drudge status")
+    print(f"Session: {local['session_id'] or '(new)'}")
+    print(f"Run status: {local['run_status']}")
+    print(f"Model: {local['model']} ({local['provider']}, {local['model_api']})")
+    print(f"Turns: {local['turns']} | Messages: {local['message_count']}")
+    print(f"Tokens this process: {local['tokens_this_process']}")
+    if local["context_limit"]:
+        used = local["context_used_percent"] or 0.0
+        print(
+            f"Context: ~{local['estimated_context_tokens']}/{local['context_limit']} "
+            f"tokens ({max(0.0, 100.0 - used):.1f}% left)"
+        )
+    print(f"Workspace: {local['workspace']}")
+    print(f"Approval mode: {local['approval_mode']}")
+    print(f"Active skills: {', '.join(local['active_skills']) or '(none)'}")
+    if result["account_usage"]:
+        from agent.codex_usage import format_codex_usage
+
+        print("\nCodex account usage")
+        for line in format_codex_usage(result["account_usage"]):
+            print(line)
+    elif result["account_usage_error"]:
+        print(f"\nCodex account usage unavailable: {result['account_usage_error']}")
+    else:
+        print("\nAccount limits: unavailable for the current non-Codex provider")
+    return result
+
+
+async def run_status(
+    config_path: str | None = None,
+    model: str | None = None,
+    no_tools: bool = False,
+    codex_config_path: str | None = None,
+    codex_oauth: bool = False,
+    approval_mode: str | None = None,
+    resume_id: str | None = None,
+    skill_names: list[str] | None = None,
+    as_json: bool = False,
+) -> None:
+    config = get_config(config_path, codex_config_path)
+    if model:
+        config.override("model", "name", value=model)
+    if no_tools:
+        config.override("toolsets", value=[])
+    if codex_oauth:
+        config.enable_codex_oauth()
+    if approval_mode:
+        config.override("security", "approval_mode", value=approval_mode)
+    if config.get("model", "auth_mode") == "codex_oauth":
+        _validate_runtime_config(config)
+    agent = Agent(config, approval_callback=ConsoleApproval())
+    if resume_id:
+        agent.resume_session(resume_id)
+    for name in skill_names or []:
+        agent.activate_skill(name)
+    await show_status(config, agent, as_json=as_json)
 
 
 def run_interactive(
@@ -441,6 +523,7 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         print("  /models             List provider models")
         print("  /sessions           List saved sessions")
         print("  /history [id]       Show saved messages")
+        print("  /status             Show session, context, and account limits")
         print("  /resume <id>        Resume a saved session")
         print("  /new                Start a new session")
         print("  /skills             List discovered skills")
@@ -469,6 +552,11 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
             print("No active session yet. Run a prompt first or pass /history <session_id>.")
         else:
             _show_history(config, session_id)
+    elif command in ("/status", "/usage"):
+        if agent is None:
+            print("Agent is unavailable.")
+        else:
+            asyncio.run(show_status(config, agent))
     elif command == "/resume":
         if agent is None:
             print("Agent is unavailable.")
@@ -741,6 +829,19 @@ def main():
             args.codex_oauth,
             args.approval_mode,
         )
+        return
+    if args.command == "status":
+        asyncio.run(run_status(
+            args.config,
+            args.model,
+            args.no_tools,
+            args.codex_config,
+            args.codex_oauth,
+            args.approval_mode,
+            args.resume,
+            args.skill,
+            getattr(args, "status_json", False),
+        ))
         return
 
     if args.version:

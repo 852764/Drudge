@@ -100,6 +100,19 @@ class AgentLoopTests(unittest.TestCase):
             payload = json.loads(fake.requests[1]["messages"][-1]["content"])
             self.assertIn("not valid JSON", payload["error"])
 
+    def test_local_status_reports_context_and_session(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            agent = Agent(test_config(workspace))
+            agent.llm = FakeLLM([chat_response("done")])
+            asyncio.run(agent.run("hello"))
+
+            status = agent.get_status()
+
+            self.assertEqual(status["run_status"], "completed")
+            self.assertEqual(status["message_count"], 3)
+            self.assertGreater(status["estimated_context_tokens"], 0)
+            self.assertEqual(status["workspace"], workspace)
+
 
 if __name__ == "__main__":
     unittest.main()
