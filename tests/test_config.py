@@ -113,6 +113,25 @@ openai_base_url = "https://proxy.example/v1"
 
         self.assertEqual(safe["model"]["headers"]["Authorization"], "***REDACTED***")
 
+    def test_safe_dict_redacts_custom_mcp_environment_secrets(self):
+        config = ConfigManager()
+        config.override("mcp_servers", value={
+            "github": {
+                "command": "server",
+                "env": {
+                    "GITHUB_TOKEN": "secret-token",
+                    "SERVICE_API_KEY": "secret-key",
+                    "MODE": "safe",
+                },
+            },
+        })
+
+        safe = config.as_safe_dict()["mcp_servers"]["github"]["env"]
+
+        self.assertEqual(safe["GITHUB_TOKEN"], "***REDACTED***")
+        self.assertEqual(safe["SERVICE_API_KEY"], "***REDACTED***")
+        self.assertEqual(safe["MODE"], "safe")
+
     def test_codex_oauth_selects_experimental_client(self):
         config = ConfigManager()
         config.enable_codex_oauth()

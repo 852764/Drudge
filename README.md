@@ -84,3 +84,4 @@ python -m unittest discover -s tests -v
 - [Drudge 状态与 Codex 限额](docs/STATUS.md)
 - [`<think>` 刷屏与无最终答案防护](docs/THINK_OUTPUT_FIX.md)
 - [LLM 上下文摘要压缩](docs/LLM_CONTEXT_COMPACTION.md)
+- [MCP、运行 Trace 与持久化任务](docs/MCP_TRACE_TASKS.md)

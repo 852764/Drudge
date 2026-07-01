@@ -4,6 +4,14 @@ from .registry import registry
 from .context import ApprovalMode, ToolContext
 from .result import ToolResult
 from .risk import ApprovalDecision, ApprovalRequest, RiskLevel, ToolRisk
+from .provider import (
+    CompositeToolProvider,
+    LocalToolProvider,
+    MCPServerProvider,
+    TaskToolProvider,
+    ToolProvider,
+    create_tool_provider,
+)
 
 # 导入触发工具注册
 from . import terminal  # noqa: F401
@@ -19,4 +27,10 @@ __all__ = [
     "ApprovalRequest",
     "RiskLevel",
     "ToolRisk",
+    "ToolProvider",
+    "LocalToolProvider",
+    "MCPServerProvider",
+    "TaskToolProvider",
+    "CompositeToolProvider",
+    "create_tool_provider",
 ]

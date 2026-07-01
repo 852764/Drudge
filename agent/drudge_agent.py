@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 from pathlib import Path
+from time import monotonic
 from typing import Any, Awaitable, Callable
 
 from .llm import LLMClient, create_client
@@ -29,8 +30,10 @@ from tools import (
     ApprovalDecision,
     ApprovalRequest,
     RiskLevel,
+    TaskToolProvider,
     ToolContext,
     ToolResult,
+    create_tool_provider,
     registry,
 )
 from prompt import build_system_prompt
@@ -68,6 +71,7 @@ class Agent:
         self._cancel_event = asyncio.Event()
         self._active_task: asyncio.Task | None = None
         self._last_compaction: dict[str, Any] | None = None
+        self._current_run_id: str | None = None
         workspace = self.config.get("security", "workspace_root", default=".")
         self.skill_manager = SkillManager(
             workspace,
@@ -75,6 +79,20 @@ class Agent:
         )
         self.active_skill_names: list[str] = []
         self._init_store()
+        task_provider = None
+        if self.store is not None:
+            task_provider = TaskToolProvider(
+                self.list_tasks,
+                self.create_task,
+                self.update_task,
+            )
+        self.tool_provider = create_tool_provider(
+            registry,
+            self.config.get_toolsets(),
+            self.config.get("mcp_servers", default={}) or {},
+            workspace,
+            task_provider=task_provider,
+        )
 
     def cancel(self) -> None:
         """Request cancellation of the current model/tool operation."""
@@ -125,6 +143,8 @@ class Agent:
                 if attempt > 0
                 else self._messages
             )
+            model_started = monotonic()
+            purpose = "reasoning_recovery" if attempt > 0 else "agent"
             try:
                 response = await self.llm.chat(
                     request_messages,
@@ -137,14 +157,49 @@ class Agent:
                     if tail:
                         turn_streamed = True
                         await self._emit(stream_callback, tail)
-            except DegenerateReasoningError:
+            except DegenerateReasoningError as exc:
+                self._record_model_call(
+                    model=self.llm.model,
+                    purpose=purpose,
+                    total_tokens=0,
+                    started_at=model_started,
+                    status="failed",
+                    error=str(exc),
+                )
                 if attempt < recovery_attempts and not "".join(parser.visible_parts).strip():
                     await self._compress_context()
                     continue
                 raise
+            except asyncio.CancelledError:
+                self._record_model_call(
+                    model=self.llm.model,
+                    purpose=purpose,
+                    total_tokens=0,
+                    started_at=model_started,
+                    status="cancelled",
+                )
+                raise
+            except Exception as exc:
+                self._record_model_call(
+                    model=self.llm.model,
+                    purpose=purpose,
+                    total_tokens=0,
+                    started_at=model_started,
+                    status="failed",
+                    error=str(exc),
+                )
+                raise
 
             usage = response.get("usage", {})
-            total_tokens += int(usage.get("total_tokens", 0) or 0)
+            call_tokens = int(usage.get("total_tokens", 0) or 0)
+            total_tokens += call_tokens
+            self._record_model_call(
+                model=self.llm.model,
+                purpose=purpose,
+                total_tokens=call_tokens,
+                started_at=model_started,
+                status="completed",
+            )
             raw_text = self.llm.extract_text(response)
             filtered = (
                 filter_reasoning_text(
@@ -201,7 +256,7 @@ class Agent:
     async def _approve_tool(self, tool_name: str, args: dict) -> bool:
         if not self.tool_context or self.tool_context.approval_mode != "on_request":
             return True
-        risk = registry.assess_risk(tool_name, args, self.tool_context)
+        risk = self.tool_provider.assess_risk(tool_name, args, self.tool_context)
         if not risk.requires_approval:
             return True
         if risk.level is RiskLevel.CRITICAL:
@@ -212,7 +267,7 @@ class Agent:
         if self.approval_callback is None:
             return False
 
-        self.run_state.transition(
+        self._transition(
             RunStatus.WAITING_FOR_APPROVAL,
             turn=self._turn_count,
             tool=tool_name,
@@ -236,6 +291,130 @@ class Agent:
         if not storage_config.get("enabled", True):
             return
         self.store = ConversationStore(storage_config.get("path", "~/.drudge/drudge.db"))
+
+    def _transition(self, status: RunStatus, *, turn: int, **detail: Any) -> None:
+        self.run_state.transition(status, turn=turn, **detail)
+        self._trace_event(
+            "state",
+            {"status": status.value, **detail},
+            turn=turn,
+        )
+
+    def _trace_event(
+        self,
+        kind: str,
+        detail: dict[str, Any] | None = None,
+        *,
+        turn: int | None = None,
+    ) -> None:
+        if self.store and self._current_run_id:
+            self.store.append_run_event(
+                self._current_run_id,
+                kind,
+                turn=self._turn_count if turn is None else turn,
+                detail=_safe_trace_detail(detail or {}),
+            )
+
+    def _record_model_call(
+        self,
+        *,
+        model: str,
+        purpose: str,
+        total_tokens: int,
+        started_at: float,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        if self.store and self._current_run_id:
+            self.store.append_model_call(
+                self._current_run_id,
+                turn=self._turn_count,
+                model=model,
+                purpose=purpose,
+                total_tokens=total_tokens,
+                latency_ms=max(0, int((monotonic() - started_at) * 1000)),
+                status=status,
+                error=error,
+            )
+
+    def _start_trace(self, prompt: str) -> None:
+        if self.store:
+            self._current_run_id = self.store.start_run(
+                self.session_id,
+                prompt,
+                self.config.get("model", "name", default="unknown"),
+                metadata={"utility_model": self.config.get_utility_model_config().get("name")},
+            )
+
+    def _finish_trace(self) -> None:
+        if self.store and self._current_run_id:
+            self.store.finish_run(
+                self._current_run_id,
+                self.run_state.status.value,
+                error=self.run_state.error,
+                metadata={
+                    "turns": self._turn_count,
+                    "tokens": self._total_tokens,
+                    "utility_tokens": self._utility_tokens,
+                },
+            )
+
+    def list_tasks(self, include_closed: bool = False) -> list[dict[str, Any]]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        if not self.session_id:
+            raise RuntimeError("No active session")
+        return self.store.list_tasks(self.session_id, include_closed=include_closed)
+
+    def create_task(self, title: str, details: str = "") -> dict[str, Any]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        if not self.session_id:
+            raise RuntimeError("No active session")
+        task = self.store.create_task(self.session_id, title, details)
+        self._trace_event("task_created", {"task": task})
+        return task
+
+    def update_task(self, task_id: int, status: str) -> dict[str, Any]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        if not self.session_id:
+            raise RuntimeError("No active session")
+        task = self.store.update_task(self.session_id, task_id, status)
+        self._trace_event("task_updated", {"task": task})
+        return task
+
+    def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        return self.store.list_runs(session_id=self.session_id, limit=limit)
+
+    def get_trace(self, run_id: str | None = None) -> dict[str, Any] | None:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        selected = run_id
+        if not selected:
+            runs = self.store.list_runs(session_id=self.session_id, limit=1)
+            selected = runs[0]["id"] if runs else None
+        return self.store.get_run_trace(selected) if selected else None
+
+    async def inspect_mcp(self) -> dict[str, Any]:
+        await self.tool_provider.start()
+        try:
+            status = self.tool_provider.status()
+            status["providers"] = [
+                item for item in status["providers"] if item.get("transport") == "stdio"
+            ]
+            return status
+        finally:
+            await self.tool_provider.close()
+
+    async def list_available_tools(self) -> list[str]:
+        await self.tool_provider.start()
+        try:
+            return self.tool_provider.tool_names()
+        finally:
+            await self.tool_provider.close()
 
     def list_skills(self) -> list[dict[str, Any]]:
         discovered = self.skill_manager.discover()
@@ -452,7 +631,7 @@ class Agent:
             if skill:
                 loaded_skills.append(skill.render())
         loaded_skills.extend(extra_skills or [])
-        return build_system_prompt(
+        system_prompt = build_system_prompt(
             toolsets,
             memory_entries,
             loaded_skills,
@@ -460,6 +639,19 @@ class Agent:
             project_instructions=project_instructions,
             skill_catalog=catalog,
         )
+        if self.store and self.session_id:
+            tasks = self.store.list_tasks(self.session_id)
+            if tasks:
+                task_lines = [
+                    f"- #{task['id']} [{task['status']}] {task['title']}"
+                    for task in tasks
+                ]
+                system_prompt += (
+                    "\n\nPERSISTENT TASKS\n"
+                    "Keep these task states accurate using task_create/task_update when useful.\n"
+                    + "\n".join(task_lines)
+                )
+        return system_prompt
 
     def _refresh_system_message(
         self,
@@ -536,9 +728,29 @@ class Agent:
 
         self._init_refusal_llm()
         review_messages = build_refusal_review_messages(user_prompt, response_text)
-        review_response = await self.refusal_llm.chat(review_messages)
+        review_started = monotonic()
+        try:
+            review_response = await self.refusal_llm.chat(review_messages)
+        except Exception as exc:
+            self._record_model_call(
+                model=self.refusal_llm.model,
+                purpose="refusal_review",
+                total_tokens=0,
+                started_at=review_started,
+                status="failed",
+                error=str(exc),
+            )
+            raise
         usage = review_response.get("usage", {})
-        self._total_tokens += usage.get("total_tokens", 0)
+        review_tokens = int(usage.get("total_tokens", 0) or 0)
+        self._total_tokens += review_tokens
+        self._record_model_call(
+            model=self.refusal_llm.model,
+            purpose="refusal_review",
+            total_tokens=review_tokens,
+            started_at=review_started,
+            status="completed",
+        )
         review_text = self.refusal_llm.extract_text(review_response) or response_text
         self._messages.append({"role": "assistant", "content": review_text})
         self._persist_message("assistant", review_text, metadata={"refusal_review": True})
@@ -548,6 +760,38 @@ class Agent:
         return reviewed
 
     async def run(
+        self,
+        prompt: str,
+        memory_entries: list[str] | None = None,
+        skills: list[str] | None = None,
+        stream_callback: Any = None,
+    ) -> str:
+        try:
+            return await self._run(
+                prompt,
+                memory_entries=memory_entries,
+                skills=skills,
+                stream_callback=stream_callback,
+            )
+        except asyncio.CancelledError:
+            if self.run_state.status is not RunStatus.CANCELLED:
+                self._transition(RunStatus.CANCELLED, turn=self.run_state.turn)
+            raise
+        except Exception as exc:
+            if self.run_state.status is not RunStatus.FAILED:
+                self._transition(
+                    RunStatus.FAILED,
+                    turn=self.run_state.turn,
+                    error=str(exc),
+                )
+            raise
+        finally:
+            await self.tool_provider.close()
+            self._finish_trace()
+            self._current_run_id = None
+            self._active_task = None
+
+    async def _run(
         self,
         prompt: str,
         memory_entries: list[str] | None = None,
@@ -571,18 +815,20 @@ class Agent:
         self._active_task = asyncio.current_task()
         self._refresh_system_message(memory_entries, skills)
         self._ensure_session(prompt, memory_entries, skills)
+        self.run_state = AgentRunState()
+        self._start_trace(prompt)
+        await self.tool_provider.start()
+        self._trace_event("tool_providers", self.tool_provider.status(), turn=0)
 
         max_turns = self.config.get_agent_config().get("max_turns", 50)
         compression_threshold = self.config.get_agent_config().get("compression_threshold", 0.80)
-        toolsets = self.config.get_toolsets()
-        tool_schemas = registry.get_schemas(toolsets)
+        tool_schemas = self.tool_provider.schemas()
 
-        self.run_state = AgentRunState()
         final_text = ""
 
         for request_turn in range(1, max_turns + 1):
             self._turn_count += 1
-            self.run_state.transition(
+            self._transition(
                 RunStatus.WAITING_FOR_MODEL,
                 turn=request_turn,
                 total_turn=self._turn_count,
@@ -607,12 +853,12 @@ class Agent:
                     stream_callback,
                 )
             except asyncio.CancelledError:
-                self.run_state.transition(RunStatus.CANCELLED, turn=request_turn)
+                self._transition(RunStatus.CANCELLED, turn=request_turn)
                 self._active_task = None
                 raise
             except DegenerateReasoningError as e:
                 error_msg = f"Model reasoning stream was stopped: {e}"
-                self.run_state.transition(
+                self._transition(
                     RunStatus.FAILED,
                     turn=request_turn,
                     error=error_msg,
@@ -621,7 +867,7 @@ class Agent:
                 break
             except Exception as e:
                 error_msg = f"LLM call failed (turn {self._turn_count}): {e}"
-                self.run_state.transition(
+                self._transition(
                     RunStatus.FAILED,
                     turn=request_turn,
                     error=error_msg,
@@ -639,7 +885,7 @@ class Agent:
                     "including after the configured recovery attempts. "
                     "Try /compact, /new, or a shorter prompt."
                 )
-                self.run_state.transition(
+                self._transition(
                     RunStatus.FAILED,
                     turn=request_turn,
                     error=error_msg,
@@ -647,7 +893,7 @@ class Agent:
                 final_text = error_msg
                 break
             if tool_calls:
-                self.run_state.transition(
+                self._transition(
                     RunStatus.EXECUTING_TOOLS,
                     turn=request_turn,
                     tool_count=len(tool_calls),
@@ -688,28 +934,32 @@ class Agent:
                         try:
                             approved = await self._approve_tool(tool_name, tool_args)
                         except asyncio.CancelledError:
-                            self.run_state.transition(RunStatus.CANCELLED, turn=request_turn)
+                            self._transition(RunStatus.CANCELLED, turn=request_turn)
                             self._active_task = None
                             raise
                         if approved:
-                            self.run_state.transition(
+                            self._transition(
                                 RunStatus.EXECUTING_TOOLS,
                                 turn=request_turn,
                                 tool=tool_name,
                             )
                             try:
-                                tool_result = await registry.dispatch_async(
+                                tool_result = await self.tool_provider.call(
                                     tool_name,
                                     tool_args,
                                     context=self.tool_context,
                                     approved=True,
                                 )
                             except asyncio.CancelledError:
-                                self.run_state.transition(RunStatus.CANCELLED, turn=request_turn)
+                                self._transition(RunStatus.CANCELLED, turn=request_turn)
                                 self._active_task = None
                                 raise
                         else:
-                            risk = registry.assess_risk(tool_name, tool_args, self.tool_context)
+                            risk = self.tool_provider.assess_risk(
+                                tool_name,
+                                tool_args,
+                                self.tool_context,
+                            )
                             error = (
                                 f"Critical-risk tool call blocked: {risk.reason}"
                                 if risk.level is RiskLevel.CRITICAL
@@ -733,6 +983,15 @@ class Agent:
                     self._messages.append(tool_msg)
                     self._persist_message("tool", tool_result, tool_call_id=tc.get("id", ""))
                     self._persist_tool_call(tool_name, persisted_args, tool_result)
+                    self._trace_event(
+                        "tool_call",
+                        {
+                            "tool": tool_name,
+                            "arguments": persisted_args,
+                            "result": tool_result,
+                        },
+                        turn=request_turn,
+                    )
 
                     # 日志（如果配置开启了）
                     if self.config.get("display", "show_tool_calls"):
@@ -749,14 +1008,14 @@ class Agent:
 
             if text:
                 final_text = text
-                self.run_state.transition(
+                self._transition(
                     RunStatus.COMPLETED,
                     turn=request_turn,
                     finish_reason=finish_reason,
                 )
                 break
             error_msg = "Model returned neither text nor tool calls"
-            self.run_state.transition(
+            self._transition(
                 RunStatus.FAILED,
                 turn=request_turn,
                 error=error_msg,
@@ -764,13 +1023,13 @@ class Agent:
             final_text = error_msg
             break
         else:
-            self.run_state.transition(RunStatus.MAX_TURNS, turn=max_turns)
+            self._transition(RunStatus.MAX_TURNS, turn=max_turns)
             final_text = f"[Agent reached maximum turns ({max_turns}). Task may be incomplete.]"
 
         try:
             reviewed = await self._review_refusal_if_needed(prompt, final_text, stream_callback)
         except asyncio.CancelledError:
-            self.run_state.transition(RunStatus.CANCELLED, turn=self.run_state.turn)
+            self._transition(RunStatus.CANCELLED, turn=self.run_state.turn)
             self._active_task = None
             raise
         self._active_task = None
@@ -806,6 +1065,7 @@ class Agent:
             try:
                 summary_llm = self._get_utility_llm()
                 summary_model = summary_llm.model
+                summary_started = monotonic()
                 response = await summary_llm.chat(
                     build_context_summary_messages(old_messages),
                     tools=None,
@@ -823,8 +1083,24 @@ class Agent:
                 summary = filtered.text.strip()
                 if not summary:
                     raise RuntimeError("context summary model returned no visible text")
+                self._record_model_call(
+                    model=summary_llm.model,
+                    purpose="context_summary",
+                    total_tokens=summary_tokens,
+                    started_at=summary_started,
+                    status="completed",
+                )
                 mode = "llm"
             except Exception as exc:
+                if summary_model:
+                    self._record_model_call(
+                        model=summary_model,
+                        purpose="context_summary",
+                        total_tokens=summary_tokens,
+                        started_at=locals().get("summary_started", monotonic()),
+                        status="failed",
+                        error=str(exc),
+                    )
                 if not fallback_enabled:
                     raise
                 error = str(exc)
@@ -850,6 +1126,7 @@ class Agent:
         if error:
             result["fallback_reason"] = error
         self._last_compaction = result
+        self._trace_event("context_compaction", result)
         return result
 
     async def compact_context(self) -> dict[str, Any]:
@@ -895,6 +1172,11 @@ class Agent:
         context_limit = int(self.config.get("model", "context_length", default=0) or 0)
         context_percent = (estimated / context_limit * 100) if context_limit else None
         storage = self.config.get_storage_config()
+        open_tasks = (
+            len(self.store.list_tasks(self.session_id))
+            if self.store and self.session_id
+            else 0
+        )
         return {
             "session_id": self.session_id,
             "run_status": self.run_state.status.value,
@@ -913,6 +1195,8 @@ class Agent:
             "workspace": str(self.config.get("security", "workspace_root", default=".")),
             "approval_mode": self.config.get("security", "approval_mode", default="auto"),
             "active_skills": list(self.active_skill_names),
+            "open_tasks": open_tasks,
+            "mcp_servers": sorted((self.config.get("mcp_servers", default={}) or {}).keys()),
             "storage_enabled": bool(storage.get("enabled", True)),
             "storage_path": storage.get("path") if storage.get("enabled", True) else None,
             "last_compaction": dict(self._last_compaction) if self._last_compaction else None,
@@ -924,3 +1208,40 @@ class Agent:
 
     def get_run_state(self) -> AgentRunState:
         return self.run_state
+
+
+def _safe_trace_detail(value: Any, *, max_string: int = 2000) -> Any:
+    sensitive = {
+        "api_key",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+        "access_token",
+        "refresh_token",
+    }
+    def sensitive_name(key: Any) -> bool:
+        normalized = str(key).lower().replace("-", "_")
+        return (
+            normalized in {name.replace("-", "_") for name in sensitive}
+            or normalized.endswith(("_token", "_secret", "_password", "_api_key"))
+        )
+
+    if isinstance(value, dict):
+        return {
+            str(key): (
+                "***REDACTED***"
+                if sensitive_name(key) and item
+                else _safe_trace_detail(item, max_string=max_string)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_safe_trace_detail(item, max_string=max_string) for item in value[:100]]
+    if isinstance(value, tuple):
+        return [_safe_trace_detail(item, max_string=max_string) for item in value[:100]]
+    if isinstance(value, str):
+        return truncate_string(value, max_string)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return truncate_string(str(value), max_string)

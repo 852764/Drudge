@@ -70,11 +70,69 @@ class ConversationStore:
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS runs (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT,
+                    prompt TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TEXT,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS run_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    turn INTEGER NOT NULL DEFAULT 0,
+                    detail_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS model_calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    turn INTEGER NOT NULL DEFAULT 0,
+                    model TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    total_tokens INTEGER NOT NULL DEFAULT 0,
+                    latency_ms INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    details TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TEXT,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_messages_session_id
                 ON messages(session_id, id);
 
                 CREATE INDEX IF NOT EXISTS idx_tool_calls_session_id
                 ON tool_calls(session_id, id);
+
+                CREATE INDEX IF NOT EXISTS idx_runs_session_id
+                ON runs(session_id, started_at);
+
+                CREATE INDEX IF NOT EXISTS idx_run_events_run_id
+                ON run_events(run_id, id);
+
+                CREATE INDEX IF NOT EXISTS idx_tasks_session_id
+                ON tasks(session_id, status, id);
                 """
             )
             columns = {
@@ -243,3 +301,239 @@ class ConversationStore:
                 (session_id,),
             ).fetchone()
         return int(row["max_turn"] if row else 0)
+
+    def start_run(
+        self,
+        session_id: str | None,
+        prompt: str,
+        model: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        run_id = uuid.uuid4().hex[:12]
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO runs (id, session_id, prompt, model, status, metadata_json)
+                VALUES (?, ?, ?, ?, 'running', ?)
+                """,
+                (
+                    run_id,
+                    session_id,
+                    prompt,
+                    model,
+                    json.dumps(metadata or {}, ensure_ascii=False, default=str),
+                ),
+            )
+        return run_id
+
+    def finish_run(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT metadata_json FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            merged_metadata = json.loads(row["metadata_json"] or "{}") if row else {}
+            merged_metadata.update(metadata or {})
+            conn.execute(
+                """
+                UPDATE runs
+                SET status = ?, error = ?, metadata_json = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    error,
+                    json.dumps(merged_metadata, ensure_ascii=False, default=str),
+                    run_id,
+                ),
+            )
+
+    def append_run_event(
+        self,
+        run_id: str,
+        kind: str,
+        *,
+        turn: int = 0,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO run_events (run_id, kind, turn, detail_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    kind,
+                    int(turn),
+                    json.dumps(detail or {}, ensure_ascii=False, default=str),
+                ),
+            )
+
+    def append_model_call(
+        self,
+        run_id: str,
+        *,
+        turn: int,
+        model: str,
+        purpose: str,
+        total_tokens: int,
+        latency_ms: int,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO model_calls
+                    (run_id, turn, model, purpose, total_tokens, latency_ms, status, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    int(turn),
+                    model,
+                    purpose,
+                    int(total_tokens),
+                    int(latency_ms),
+                    status,
+                    error,
+                ),
+            )
+
+    def list_runs(
+        self,
+        *,
+        session_id: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        where = "WHERE session_id = ?" if session_id else ""
+        params: tuple[Any, ...] = (session_id, limit) if session_id else (limit,)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, session_id, prompt, model, status, error, metadata_json,
+                       started_at, completed_at
+                FROM runs
+                {where}
+                ORDER BY started_at DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            result.append(item)
+        return result
+
+    def get_run_trace(self, run_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            run = conn.execute(
+                """
+                SELECT id, session_id, prompt, model, status, error, metadata_json,
+                       started_at, completed_at
+                FROM runs WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                return None
+            events = conn.execute(
+                """
+                SELECT id, kind, turn, detail_json, created_at
+                FROM run_events WHERE run_id = ? ORDER BY id
+                """,
+                (run_id,),
+            ).fetchall()
+            calls = conn.execute(
+                """
+                SELECT id, turn, model, purpose, total_tokens, latency_ms, status, error, created_at
+                FROM model_calls WHERE run_id = ? ORDER BY id
+                """,
+                (run_id,),
+            ).fetchall()
+        result = dict(run)
+        result["metadata"] = json.loads(result.pop("metadata_json") or "{}")
+        result["events"] = []
+        for row in events:
+            item = dict(row)
+            item["detail"] = json.loads(item.pop("detail_json") or "{}")
+            result["events"].append(item)
+        result["model_calls"] = [dict(row) for row in calls]
+        return result
+
+    def create_task(self, session_id: str, title: str, details: str = "") -> dict[str, Any]:
+        clean_title = " ".join(title.split()).strip()
+        if not clean_title:
+            raise ValueError("Task title cannot be empty")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO tasks (session_id, title, details)
+                VALUES (?, ?, ?)
+                """,
+                (session_id, clean_title[:240], details.strip()[:8000]),
+            )
+            task_id = int(cursor.lastrowid)
+        return self.get_task(session_id, task_id)
+
+    def get_task(self, session_id: str, task_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, session_id, title, details, status, created_at, updated_at, completed_at
+                FROM tasks WHERE session_id = ? AND id = ?
+                """,
+                (session_id, int(task_id)),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Task not found: {task_id}")
+        return dict(row)
+
+    def list_tasks(
+        self,
+        session_id: str,
+        *,
+        include_closed: bool = False,
+    ) -> list[dict[str, Any]]:
+        condition = "" if include_closed else "AND status NOT IN ('completed', 'cancelled')"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, session_id, title, details, status, created_at, updated_at, completed_at
+                FROM tasks
+                WHERE session_id = ? {condition}
+                ORDER BY
+                    CASE status WHEN 'in_progress' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+                    id
+                """,
+                (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_task(self, session_id: str, task_id: int, status: str) -> dict[str, Any]:
+        allowed = {"pending", "in_progress", "completed", "cancelled"}
+        if status not in allowed:
+            raise ValueError(f"Invalid task status: {status}")
+        completed = "CURRENT_TIMESTAMP" if status in {"completed", "cancelled"} else "NULL"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE tasks
+                SET status = ?, updated_at = CURRENT_TIMESTAMP, completed_at = {completed}
+                WHERE session_id = ? AND id = ?
+                """,
+                (status, session_id, int(task_id)),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Task not found: {task_id}")
+        return self.get_task(session_id, task_id)

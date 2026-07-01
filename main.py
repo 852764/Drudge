@@ -3,6 +3,7 @@
 import sys
 import asyncio
 import argparse
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -319,6 +320,8 @@ async def show_status(config, agent: Agent, *, as_json: bool = False) -> dict:
     print(f"Workspace: {local['workspace']}")
     print(f"Approval mode: {local['approval_mode']}")
     print(f"Active skills: {', '.join(local['active_skills']) or '(none)'}")
+    print(f"Open tasks: {local['open_tasks']}")
+    print(f"MCP servers: {', '.join(local['mcp_servers']) or '(none)'}")
     if result["account_usage"]:
         from agent.codex_usage import format_codex_usage
 
@@ -538,10 +541,16 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         print("  /quit, /exit, /q    Exit Drudge")
         print("  /help               Show this help")
         print("  /tools              List available tools")
+        print("  /mcp                Inspect configured MCP stdio servers")
         print("  /config             Show current config")
         print("  /models             List provider models")
         print("  /sessions           List saved sessions")
         print("  /history [id]       Show saved messages")
+        print("  /runs               List recent runs")
+        print("  /trace [run_id]     Show a persisted run trace")
+        print("  /tasks [all]        List persistent session tasks")
+        print("  /task add <title>   Create a persistent task")
+        print("  /task start|done|cancel|reopen <id>")
         print("  /status             Show session, context, and account limits")
         print("  /compact            Compact older conversation context")
         print("  /resume <id>        Resume a saved session")
@@ -553,12 +562,15 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         print("  /skill clear        Deactivate all skills")
         print("  /clear              Clear screen")
     elif command == "/tools":
-        from tools import registry
-        toolsets = config.get_toolsets()
-        names = registry.list_tools(toolsets)
-        print(f"Available tools ({', '.join(toolsets)}):")
+        names = asyncio.run(agent.list_available_tools()) if agent else []
+        print("Available tools:")
         for name in sorted(names):
             print(f"  - {name}")
+    elif command == "/mcp":
+        if agent is None:
+            print("Agent is unavailable.")
+        else:
+            _show_mcp(asyncio.run(agent.inspect_mcp()))
     elif command == "/config":
         import yaml
         print(yaml.dump(config.as_safe_dict(), default_flow_style=False, allow_unicode=True))
@@ -572,6 +584,14 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
             print("No active session yet. Run a prompt first or pass /history <session_id>.")
         else:
             _show_history(config, session_id)
+    elif command == "/runs":
+        _show_runs(agent)
+    elif command == "/trace":
+        _show_trace(agent, parts[1] if len(parts) > 1 else None)
+    elif command == "/tasks":
+        _show_tasks(agent, include_closed=len(parts) > 1 and parts[1].lower() == "all")
+    elif command == "/task":
+        _handle_task_command(parts[1:], agent)
     elif command in ("/status", "/usage"):
         if agent is None:
             print("Agent is unavailable.")
@@ -633,6 +653,116 @@ def _show_skills(agent: Agent | None) -> None:
     for skill in skills:
         marker = "*" if skill["active"] else " "
         print(f"[{marker}] {skill['name']}: {skill['description']}")
+
+
+def _show_mcp(status: dict) -> None:
+    providers = status.get("providers") or []
+    if not providers:
+        print("No MCP servers configured.")
+        return
+    for item in providers:
+        state = "connected" if item.get("connected") else "unavailable"
+        print(f"{item['name']}: {state}")
+        if item.get("error"):
+            print(f"  error: {item['error']}")
+        for tool in item.get("tools") or []:
+            print(f"  - {tool}")
+
+
+def _show_runs(agent: Agent | None) -> None:
+    if agent is None:
+        print("Agent is unavailable.")
+        return
+    try:
+        runs = agent.list_runs()
+    except RuntimeError as exc:
+        print(str(exc))
+        return
+    if not runs:
+        print("No persisted runs for this session.")
+        return
+    for run in runs:
+        print(
+            f"{run['id']}  {run['status']:<10}  {run['model']}  "
+            f"{run['started_at']}  {run['prompt'][:60]}"
+        )
+
+
+def _show_trace(agent: Agent | None, run_id: str | None) -> None:
+    if agent is None:
+        print("Agent is unavailable.")
+        return
+    try:
+        trace = agent.get_trace(run_id)
+    except RuntimeError as exc:
+        print(str(exc))
+        return
+    if trace is None:
+        print("No persisted trace found.")
+        return
+    print(
+        f"Run {trace['id']} | {trace['status']} | model={trace['model']} | "
+        f"started={trace['started_at']}"
+    )
+    if trace.get("error"):
+        print(f"Error: {trace['error']}")
+    print("Model calls:")
+    for call in trace.get("model_calls") or []:
+        print(
+            f"  turn={call['turn']} purpose={call['purpose']} model={call['model']} "
+            f"status={call['status']} tokens={call['total_tokens']} latency={call['latency_ms']}ms"
+        )
+    print("Events:")
+    for event in trace.get("events") or []:
+        detail = json.dumps(event["detail"], ensure_ascii=False)
+        print(f"  turn={event['turn']} {event['kind']}: {detail[:500]}")
+
+
+def _show_tasks(agent: Agent | None, *, include_closed: bool = False) -> None:
+    if agent is None:
+        print("Agent is unavailable.")
+        return
+    try:
+        tasks = agent.list_tasks(include_closed=include_closed)
+    except RuntimeError as exc:
+        print(str(exc))
+        return
+    if not tasks:
+        print("No tasks for the active session.")
+        return
+    for task in tasks:
+        print(f"#{task['id']} [{task['status']}] {task['title']}")
+        if task.get("details"):
+            print(f"  {task['details']}")
+
+
+def _handle_task_command(arguments: list[str], agent: Agent | None) -> None:
+    if agent is None:
+        print("Agent is unavailable.")
+        return
+    if not arguments:
+        print("Usage: /task add <title> | start|done|cancel|reopen <id>")
+        return
+    action = arguments[0].lower()
+    try:
+        if action == "add":
+            title = " ".join(arguments[1:]).strip()
+            task = agent.create_task(title)
+            print(f"Created task #{task['id']}: {task['title']}")
+            return
+        status_map = {
+            "start": "in_progress",
+            "done": "completed",
+            "cancel": "cancelled",
+            "reopen": "pending",
+        }
+        if action not in status_map or len(arguments) != 2:
+            print("Usage: /task add <title> | start|done|cancel|reopen <id>")
+            return
+        task = agent.update_task(int(arguments[1]), status_map[action])
+        print(f"Task #{task['id']} -> {task['status']}: {task['title']}")
+    except (KeyError, RuntimeError, ValueError) as exc:
+        print(str(exc))
 
 
 def _handle_skill_command(arguments: list[str], agent: Agent | None) -> None:
@@ -772,6 +902,8 @@ def run_doctor(
     print(f"Base URL: {config.get('model', 'base_url')}")
     print(f"Model API: {config.get('model', 'api', default='auto')}")
     print(f"Toolsets: {', '.join(config.get_toolsets()) or '(none)'}")
+    mcp_servers = config.get("mcp_servers", default={}) or {}
+    print(f"MCP servers: {', '.join(sorted(mcp_servers)) or '(none)'}")
 
     security = config.get_security_config()
     workspace = Path(security.get("workspace_root") or os.getcwd()).expanduser().resolve()

@@ -55,6 +55,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "path": os.getenv("DRUDGE_DB_PATH", "~/.drudge/drudge.db"),
     },
+    "mcp_servers": {},
     "security": {
         "workspace_root": os.getenv("DRUDGE_WORKSPACE", os.getcwd()),
         "allow_outside_workspace": False,
@@ -251,10 +252,17 @@ class ConfigManager:
             "x-api-key",
         }
 
+        def is_sensitive_name(key: Any) -> bool:
+            normalized = str(key).lower().replace("-", "_")
+            return (
+                normalized in {name.replace("-", "_") for name in sensitive_names}
+                or normalized.endswith(("_token", "_secret", "_password", "_api_key"))
+            )
+
         def redact(value: Any) -> Any:
             if isinstance(value, dict):
                 return {
-                    key: "***REDACTED***" if key.lower() in sensitive_names and item else redact(item)
+                    key: "***REDACTED***" if is_sensitive_name(key) and item else redact(item)
                     for key, item in value.items()
                 }
             if isinstance(value, list):
