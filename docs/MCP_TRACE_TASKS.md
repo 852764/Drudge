@@ -23,7 +23,7 @@ mcp_servers:
       HELPER_MODE: safe
 ```
 
-每个服务在一次 Agent run 开始时启动，完成或取消时关闭。Drudge 会执行 MCP initialize、tools/list 和 tools/call。暴露给模型的工具名带命名空间：
+交互模式下，每个服务在 AgentRuntime 启动时连接，多个 turn 复用同一进程，退出交互模式时关闭。单次查询则在该次 Agent run 前后启动和关闭。Drudge 会执行 MCP initialize、tools/list 和 tools/call。暴露给模型的工具名带命名空间：
 
 ```text
 mcp__local-helper__tool-name

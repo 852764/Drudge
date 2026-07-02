@@ -5,11 +5,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
 from agent import Agent, RunStatus
-from agent.codex_client import CodexOAuthClient
+from agent.codex_client import CodexOAuthClient, CodexTransportError
 from config import ConfigManager
 from tools import registry
 
@@ -29,6 +30,22 @@ def credentials(force_refresh: bool = False) -> dict:
         "account_id": "acct-test",
         "base_url": "https://chatgpt.com/backend-api/codex",
     }
+
+
+class BrokenSSEStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        event = {
+            "type": "response.output_text.delta",
+            "delta": "partial",
+        }
+        yield f"data: {json.dumps(event)}\n\n".encode()
+        raise httpx.ReadTimeout(
+            "",
+            request=httpx.Request("POST", "https://example.invalid/responses"),
+        )
+
+    async def aclose(self) -> None:
+        return None
 
 
 class CodexClientTests(unittest.TestCase):
@@ -148,6 +165,61 @@ class CodexClientTests(unittest.TestCase):
 
         self.assertEqual(captured["body"]["tools"][0]["type"], "function")
         self.assertNotIn("function", captured["body"]["tools"][0])
+
+    def test_transient_timeout_before_output_is_retried(self):
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ReadTimeout("", request=request)
+            return sse_response([
+                {"type": "response.output_text.delta", "delta": "recovered"},
+                {"type": "response.completed", "response": {"status": "completed"}},
+            ])
+
+        client = CodexOAuthClient(
+            model="gpt-5.5",
+            max_retries=3,
+            credential_resolver=credentials,
+            transport=httpx.MockTransport(handler),
+        )
+        with patch("agent.codex_client.asyncio.sleep", new=AsyncMock()) as sleep:
+            response = asyncio.run(client.chat([{"role": "user", "content": "test"}]))
+
+        self.assertEqual(client.extract_text(response), "recovered")
+        self.assertEqual(calls, 2)
+        sleep.assert_awaited_once()
+
+    def test_partial_stream_timeout_is_not_retried(self):
+        calls = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            calls += 1
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "text/event-stream"},
+                stream=BrokenSSEStream(),
+            )
+
+        client = CodexOAuthClient(
+            model="gpt-5.5",
+            max_retries=3,
+            credential_resolver=credentials,
+            transport=httpx.MockTransport(handler),
+        )
+        deltas = []
+
+        with self.assertRaisesRegex(CodexTransportError, "ReadTimeout"):
+            asyncio.run(client.chat(
+                [{"role": "user", "content": "test"}],
+                stream_callback=deltas.append,
+            ))
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(deltas, ["partial"])
 
 
 if __name__ == "__main__":

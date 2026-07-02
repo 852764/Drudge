@@ -10,6 +10,7 @@ import httpx
 
 from .codex_auth import CODEX_BASE_URL, resolve_runtime_credentials
 from .llm import LLMClient
+from utils import format_exception
 
 
 class CodexProviderError(RuntimeError):
@@ -18,12 +19,19 @@ class CodexProviderError(RuntimeError):
         self.status_code = status_code
 
 
+class CodexTransportError(CodexProviderError):
+    def __init__(self, message: str, *, partial_output: bool = False):
+        super().__init__(message)
+        self.partial_output = partial_output
+
+
 class CodexOAuthClient(LLMClient):
     def __init__(
         self,
         *,
         model: str,
         timeout: int = 300,
+        max_retries: int = 3,
         credential_resolver: Callable[[bool], dict[str, Any]] | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
@@ -33,7 +41,7 @@ class CodexOAuthClient(LLMClient):
             model=model,
             api_type="codex_responses",
             timeout=timeout,
-            max_retries=1,
+            max_retries=max(1, int(max_retries)),
         )
         self._credential_resolver = credential_resolver or resolve_runtime_credentials
         self._transport = transport
@@ -47,17 +55,34 @@ class CodexOAuthClient(LLMClient):
         cancel_event: asyncio.Event | None = None,
     ) -> dict:
         credentials = await asyncio.to_thread(self._credential_resolver, False)
-        try:
-            return await self._stream_response(
-                messages, tools, tool_choice, credentials, stream_callback, cancel_event
-            )
-        except CodexProviderError as exc:
-            if exc.status_code != 401:
-                raise
-        credentials = await asyncio.to_thread(self._credential_resolver, True)
-        return await self._stream_response(
-            messages, tools, tool_choice, credentials, stream_callback, cancel_event
-        )
+        refreshed = False
+        failed_attempts = 0
+        retryable_statuses = {429, 500, 502, 503, 504}
+        while True:
+            try:
+                return await self._stream_response(
+                    messages,
+                    tools,
+                    tool_choice,
+                    credentials,
+                    stream_callback,
+                    cancel_event,
+                )
+            except CodexProviderError as exc:
+                if exc.status_code == 401 and not refreshed:
+                    credentials = await asyncio.to_thread(self._credential_resolver, True)
+                    refreshed = True
+                    continue
+                retryable = (
+                    isinstance(exc, CodexTransportError)
+                    and not exc.partial_output
+                ) or exc.status_code in retryable_statuses
+                if not retryable:
+                    raise
+                failed_attempts += 1
+                if failed_attempts >= self.max_retries:
+                    raise
+                await asyncio.sleep(min(2 ** (failed_attempts - 1), 10))
 
     @staticmethod
     def _instructions_and_input(messages: list[dict]) -> tuple[str, list[dict]]:
@@ -111,26 +136,39 @@ class CodexOAuthClient(LLMClient):
 
         base_url = str(credentials.get("base_url") or CODEX_BASE_URL).rstrip("/")
         timeout = httpx.Timeout(float(self.timeout))
-        async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
-            async with client.stream(
-                "POST",
-                f"{base_url}/responses",
-                headers=self._headers(credentials),
-                json=body,
-            ) as response:
-                if response.status_code >= 400:
-                    raw = (await response.aread()).decode("utf-8", errors="replace")[:1000]
-                    raise CodexProviderError(
-                        f"Codex backend HTTP {response.status_code}: {raw}",
-                        status_code=response.status_code,
+        progress = {"has_output": False}
+        try:
+            async with httpx.AsyncClient(timeout=timeout, transport=self._transport) as client:
+                async with client.stream(
+                    "POST",
+                    f"{base_url}/responses",
+                    headers=self._headers(credentials),
+                    json=body,
+                ) as response:
+                    if response.status_code >= 400:
+                        raw = (await response.aread()).decode("utf-8", errors="replace")[:1000]
+                        raise CodexProviderError(
+                            f"Codex backend HTTP {response.status_code}: {raw}",
+                            status_code=response.status_code,
+                        )
+                    return await self._consume_sse(
+                        response,
+                        stream_callback,
+                        cancel_event,
+                        progress,
                     )
-                return await self._consume_sse(response, stream_callback, cancel_event)
+        except httpx.TransportError as exc:
+            raise CodexTransportError(
+                f"Codex transport failed: {format_exception(exc)}",
+                partial_output=bool(progress["has_output"]),
+            ) from exc
 
     async def _consume_sse(
         self,
         response: httpx.Response,
         stream_callback: Callable[[str], Any] | None = None,
         cancel_event: asyncio.Event | None = None,
+        progress: dict[str, bool] | None = None,
     ) -> dict:
         output_items: list[dict] = []
         text_parts: list[str] = []
@@ -157,11 +195,15 @@ class CodexOAuthClient(LLMClient):
             if event_type == "response.output_text.delta" and event.get("delta"):
                 delta = str(event["delta"])
                 text_parts.append(delta)
+                if progress is not None:
+                    progress["has_output"] = True
                 await self._emit_delta(stream_callback, delta)
             elif event_type == "response.output_item.done":
                 item = event.get("item")
                 if isinstance(item, dict):
                     output_items.append(item)
+                    if progress is not None:
+                        progress["has_output"] = True
             elif event_type in (
                 "response.completed",
                 "response.incomplete",
@@ -176,10 +218,16 @@ class CodexOAuthClient(LLMClient):
                         usage = terminal["usage"]
                     if event_type == "response.failed" and terminal.get("error"):
                         raise CodexProviderError(f"Codex response failed: {terminal['error']}")
+                    if event_type == "response.incomplete":
+                        details = terminal.get("incomplete_details") or "no details"
+                        raise CodexProviderError(f"Codex response incomplete: {details}")
                 break
 
-        if not saw_terminal and not output_items and not text_parts:
-            raise CodexProviderError("Codex stream ended without a terminal response")
+        if not saw_terminal:
+            raise CodexTransportError(
+                "Codex stream ended without a terminal response",
+                partial_output=bool(output_items or text_parts),
+            )
         if not output_items and text_parts:
             output_items.append({
                 "type": "message",

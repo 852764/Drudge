@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent import Agent
+from agent import Agent, AgentRuntime
 from config import ConfigManager
 from tests.fakes import FakeLLM, chat_response, function_call
 from tools import ToolContext, create_tool_provider, registry
@@ -122,6 +122,45 @@ class MCPTraceTaskTests(unittest.TestCase):
             tool_message = fake.requests[1]["messages"][-1]
             self.assertEqual(tool_message["role"], "tool")
             self.assertIn("echo:from-agent", tool_message["content"])
+
+    def test_agent_runtime_reuses_one_mcp_process_across_turns(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            fake = FakeLLM([
+                chat_response(
+                    finish_reason="tool_calls",
+                    tool_calls=[function_call("call-1", "mcp__demo__echo", '{"text":"one"}')],
+                ),
+                chat_response("first complete"),
+                chat_response(
+                    finish_reason="tool_calls",
+                    tool_calls=[function_call("call-2", "mcp__demo__echo", '{"text":"two"}')],
+                ),
+                chat_response("second complete"),
+            ])
+            agent = Agent(mcp_config(workspace))
+            agent.llm = fake
+            runtime = AgentRuntime(agent)
+
+            async def exercise():
+                async with runtime:
+                    first = await runtime.run_turn("first")
+                    self.assertTrue(agent.started)
+                    second = await runtime.run_turn("second")
+                    self.assertTrue(agent.started)
+                    return first, second
+
+            first, second = asyncio.run(exercise())
+
+            self.assertEqual((first, second), ("first complete", "second complete"))
+            first_tool = json.loads(fake.requests[1]["messages"][-1]["content"])
+            second_tool = json.loads(fake.requests[3]["messages"][-1]["content"])
+            first_pid = first_tool["content"].split(";pid:")[-1]
+            second_pid = second_tool["content"].split(";pid:")[-1]
+            self.assertEqual(first_pid, second_pid)
+            self.assertFalse(agent.started)
+            self.assertFalse(runtime.started)
+            with self.assertRaisesRegex(RuntimeError, "closed"):
+                asyncio.run(runtime.run_turn("too late"))
 
     def test_trace_and_tasks_survive_resume(self):
         with tempfile.TemporaryDirectory() as workspace:

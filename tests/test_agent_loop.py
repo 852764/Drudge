@@ -170,6 +170,16 @@ class AgentLoopTests(unittest.TestCase):
             self.assertIn("provider down", result)
             self.assertEqual(agent.get_run_state().status, RunStatus.FAILED)
 
+    def test_empty_exception_message_still_reports_exception_type(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            agent = Agent(test_config(workspace))
+            agent.llm = FakeLLM([RuntimeError()])
+
+            result = asyncio.run(agent.run("hello"))
+
+            self.assertIn("RuntimeError", result)
+            self.assertNotEqual(result.rstrip(), "LLM call failed (turn 1):")
+
     def test_empty_model_response_is_failure(self):
         with tempfile.TemporaryDirectory() as workspace:
             agent = Agent(test_config(workspace))

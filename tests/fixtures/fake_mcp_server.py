@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 
@@ -37,7 +38,10 @@ for raw in sys.stdin:
     elif method == "tools/call":
         arguments = request.get("params", {}).get("arguments", {})
         result = {
-            "content": [{"type": "text", "text": f"echo:{arguments.get('text', '')}"}],
+            "content": [{
+                "type": "text",
+                "text": f"echo:{arguments.get('text', '')};pid:{os.getpid()}",
+            }],
             "isError": False,
         }
     else:

@@ -8,7 +8,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from agent import Agent
+from agent import Agent, AgentRuntime
 from agent.llm import create_client
 from config import ConfigManager, get_config
 from tools import ApprovalDecision, ApprovalRequest
@@ -55,6 +55,19 @@ class _StreamPrinter:
 async def _run_and_print(agent: Agent, query: str) -> str:
     printer = _StreamPrinter()
     response = await agent.run(query, stream_callback=printer)
+    if printer.seen:
+        print()
+        streamed = "".join(printer.parts).rstrip()
+        if response.strip() and not streamed.endswith(response.rstrip()):
+            print(response)
+    else:
+        print(response)
+    return response
+
+
+async def _run_runtime_and_print(runtime: AgentRuntime, query: str) -> str:
+    printer = _StreamPrinter()
+    response = await runtime.run_turn(query, stream_callback=printer)
     if printer.seen:
         print()
         streamed = "".join(printer.parts).rstrip()
@@ -303,6 +316,7 @@ async def show_status(config, agent: Agent, *, as_json: bool = False) -> dict:
     print("Drudge status")
     print(f"Session: {local['session_id'] or '(new)'}")
     print(f"Run status: {local['run_status']}")
+    print(f"Runtime: {'started' if local['runtime_started'] else 'scoped/not started'}")
     print(f"Model: {local['model']} ({local['provider']}, {local['model_api']})")
     utility_suffix = "configured" if local["utility_model_configured"] else "primary reused"
     print(f"Utility model: {local['utility_model']} ({utility_suffix})")
@@ -322,6 +336,13 @@ async def show_status(config, agent: Agent, *, as_json: bool = False) -> dict:
     print(f"Active skills: {', '.join(local['active_skills']) or '(none)'}")
     print(f"Open tasks: {local['open_tasks']}")
     print(f"MCP servers: {', '.join(local['mcp_servers']) or '(none)'}")
+    selection = local.get("last_tool_selection")
+    if selection:
+        print(
+            f"Tool selection: {selection['mode']} "
+            f"({len(selection['selected'])}/{selection['catalog_tools']} tools, "
+            f"~{selection['schema_tokens']} schema tokens)"
+        )
     if result["account_usage"]:
         from agent.codex_usage import format_codex_usage
 
@@ -423,40 +444,7 @@ def run_interactive(
 
     session = PromptSession(style=style)
 
-    while True:
-        try:
-            user_input = session.prompt([("class:prompt", "\n> ")])
-
-            if not user_input.strip():
-                continue
-
-            # 处理 slash 命令
-            if user_input.startswith("/"):
-                _handle_command(user_input, config, agent)
-                continue
-
-            try:
-                asyncio.run(_run_and_print(agent, user_input))
-            except KeyboardInterrupt:
-                agent.cancel()
-                print("\nCancelled. Ready for the next prompt.")
-                continue
-
-            usage = agent.get_token_usage()
-            if config.get("display", "show_cost"):
-                print(
-                    f"Tokens: {usage['total_tokens']} | Utility: {usage['utility_tokens']} "
-                    f"| Turns: {usage['turns']}"
-                )
-            if agent.session_id:
-                print(f"Session: {agent.session_id}")
-
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
-        except EOFError:
-            print("\nGoodbye!")
-            break
+    asyncio.run(_interactive_loop(config, agent, session=session))
 
 
 def _run_simple_interactive(
@@ -494,48 +482,54 @@ def _run_simple_interactive(
     print("Type /quit to exit")
     print("-" * 60)
 
-    while True:
-        try:
-            user_input = input("\n> ")
+    asyncio.run(_interactive_loop(config, agent, session=None))
+
+
+async def _interactive_loop(config, agent: Agent, *, session=None) -> None:
+    runtime = AgentRuntime(agent)
+    async with runtime:
+        while True:
+            try:
+                if session is not None:
+                    user_input = await session.prompt_async([("class:prompt", "\n> ")])
+                else:
+                    user_input = await asyncio.to_thread(input, "\n> ")
+            except (KeyboardInterrupt, EOFError):
+                print("\nGoodbye!")
+                break
 
             if not user_input.strip():
                 continue
-
             if user_input.startswith("/"):
-                _handle_command(user_input, config, agent)
+                if await _handle_command(user_input, config, agent):
+                    break
                 continue
 
             try:
-                asyncio.run(_run_and_print(agent, user_input))
+                await _run_runtime_and_print(runtime, user_input)
             except KeyboardInterrupt:
-                agent.cancel()
+                runtime.cancel()
                 print("\nCancelled. Ready for the next prompt.")
                 continue
 
             usage = agent.get_token_usage()
-            print(
-                f"\nTokens: {usage['total_tokens']} | Utility: {usage['utility_tokens']} "
-                f"| Turns: {usage['turns']}"
-            )
+            if config.get("display", "show_cost"):
+                print(
+                    f"Tokens: {usage['total_tokens']} | Utility: {usage['utility_tokens']} "
+                    f"| Turns: {usage['turns']}"
+                )
             if agent.session_id:
                 print(f"Session: {agent.session_id}")
 
-        except KeyboardInterrupt:
-            print("\nGoodbye!")
-            break
-        except EOFError:
-            print("\nGoodbye!")
-            break
 
-
-def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
+async def _handle_command(cmd: str, config, agent: Agent | None = None) -> bool:
     """处理 slash 命令"""
     parts = cmd.strip().split()
     command = parts[0].lower()
 
     if command in ("/quit", "/exit", "/q"):
         print("Goodbye!")
-        sys.exit(0)
+        return True
     elif command == "/help":
         print("Commands:")
         print("  /quit, /exit, /q    Exit Drudge")
@@ -562,7 +556,7 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         print("  /skill clear        Deactivate all skills")
         print("  /clear              Clear screen")
     elif command == "/tools":
-        names = asyncio.run(agent.list_available_tools()) if agent else []
+        names = await agent.list_available_tools() if agent else []
         print("Available tools:")
         for name in sorted(names):
             print(f"  - {name}")
@@ -570,12 +564,12 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         if agent is None:
             print("Agent is unavailable.")
         else:
-            _show_mcp(asyncio.run(agent.inspect_mcp()))
+            _show_mcp(await agent.inspect_mcp())
     elif command == "/config":
         import yaml
         print(yaml.dump(config.as_safe_dict(), default_flow_style=False, allow_unicode=True))
     elif command == "/models":
-        asyncio.run(show_models_from_config(config))
+        await show_models_from_config(config)
     elif command == "/sessions":
         _show_sessions(config)
     elif command == "/history":
@@ -596,12 +590,12 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         if agent is None:
             print("Agent is unavailable.")
         else:
-            asyncio.run(show_status(config, agent))
+            await show_status(config, agent)
     elif command == "/compact":
         if agent is None:
             print("Agent is unavailable.")
         else:
-            result = asyncio.run(agent.compact_context())
+            result = await agent.compact_context()
             print(
                 f"Context compacted: {result['before_messages']} -> {result['after_messages']} messages, "
                 f"~{result['before_tokens']} -> ~{result['after_tokens']} tokens "
@@ -640,6 +634,7 @@ def _handle_command(cmd: str, config, agent: Agent | None = None) -> None:
         os.system("cls" if os.name == "nt" else "clear")
     else:
         print(f"Unknown command: {command}. Type /help for available commands.")
+    return False
 
 
 def _show_skills(agent: Agent | None) -> None:
@@ -904,6 +899,12 @@ def run_doctor(
     print(f"Toolsets: {', '.join(config.get_toolsets()) or '(none)'}")
     mcp_servers = config.get("mcp_servers", default={}) or {}
     print(f"MCP servers: {', '.join(sorted(mcp_servers)) or '(none)'}")
+    selection = config.get("tool_selection", default={}) or {}
+    print(
+        f"Tool selection: enabled={selection.get('enabled', True)}, "
+        f"min_tools={selection.get('min_tools', 16)}, "
+        f"min_schema_tokens={selection.get('min_schema_tokens', 3000)}"
+    )
 
     security = config.get_security_config()
     workspace = Path(security.get("workspace_root") or os.getcwd()).expanduser().resolve()

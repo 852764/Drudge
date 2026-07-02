@@ -595,6 +595,7 @@ def create_client(config: dict) -> LLMClient:
         return CodexOAuthClient(
             model=config["name"],
             timeout=config.get("timeout", 300),
+            max_retries=config.get("max_retries", 3),
         )
     return LLMClient(
         base_url=config["base_url"],

@@ -23,6 +23,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "temperature": 0.7,
         "max_tokens": 4096,
         "context_length": 128000,
+        "max_retries": 3,
         "api": os.getenv("DRUDGE_MODEL_API", "auto"),
         "aliases": {},
     },
@@ -56,6 +57,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "path": os.getenv("DRUDGE_DB_PATH", "~/.drudge/drudge.db"),
     },
     "mcp_servers": {},
+    "tool_selection": {
+        "enabled": True,
+        "min_tools": 16,
+        "min_schema_tokens": 3000,
+        "max_selected": 12,
+        "search_limit": 5,
+        "sticky_recent": 4,
+        "always_include": [],
+    },
     "security": {
         "workspace_root": os.getenv("DRUDGE_WORKSPACE", os.getcwd()),
         "allow_outside_workspace": False,

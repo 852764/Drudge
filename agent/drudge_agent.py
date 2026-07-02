@@ -26,11 +26,17 @@ from .storage import ConversationStore
 from .project_instructions import load_project_instructions, render_project_instructions
 from .skills import Skill, SkillManager
 from .state import AgentRunState, RunStatus
+from .tool_selector import (
+    build_tool_selection_messages,
+    parse_tool_selection,
+    rank_tool_catalog,
+)
 from tools import (
     ApprovalDecision,
     ApprovalRequest,
     RiskLevel,
     TaskToolProvider,
+    ToolSearchProvider,
     ToolContext,
     ToolResult,
     create_tool_provider,
@@ -38,7 +44,7 @@ from tools import (
 )
 from prompt import build_system_prompt
 from config import get_config, ConfigManager
-from utils import truncate_string
+from utils import format_exception, truncate_string
 
 # 工具调用结果的最大字符数
 MAX_TOOL_RESULT_CHARS = 10000
@@ -70,7 +76,12 @@ class Agent:
         self._session_approvals: set[tuple[str, str]] = set()
         self._cancel_event = asyncio.Event()
         self._active_task: asyncio.Task | None = None
+        self._started = False
         self._last_compaction: dict[str, Any] | None = None
+        self._last_tool_selection: dict[str, Any] | None = None
+        self._turn_tool_names: set[str] = set()
+        self._tool_selection_active = False
+        self._recent_tool_names: list[str] = []
         self._current_run_id: str | None = None
         workspace = self.config.get("security", "workspace_root", default=".")
         self.skill_manager = SkillManager(
@@ -86,12 +97,26 @@ class Agent:
                 self.create_task,
                 self.update_task,
             )
+        selection_enabled = bool(
+            self.config.get("tool_selection", "enabled", default=True)
+        )
+        search_provider = (
+            ToolSearchProvider(
+                self._search_and_activate_tools,
+                default_limit=int(
+                    self.config.get("tool_selection", "search_limit", default=5)
+                ),
+            )
+            if selection_enabled
+            else None
+        )
         self.tool_provider = create_tool_provider(
             registry,
             self.config.get_toolsets(),
             self.config.get("mcp_servers", default={}) or {},
             workspace,
             task_provider=task_provider,
+            search_provider=search_provider,
         )
 
     def cancel(self) -> None:
@@ -100,6 +125,25 @@ class Agent:
         task = self._active_task
         if task and not task.done():
             task.get_loop().call_soon_threadsafe(task.cancel)
+
+    @property
+    def started(self) -> bool:
+        return self._started
+
+    async def start(self) -> None:
+        """Initialize reusable clients and tool-provider processes."""
+        if self._started:
+            return
+        self._init_llm()
+        await self.tool_provider.start()
+        self._started = True
+
+    async def close(self) -> None:
+        """Release provider processes owned by this Agent."""
+        if not self._started:
+            return
+        await self.tool_provider.close()
+        self._started = False
 
     async def _emit(self, callback: Any, text: str) -> None:
         if not callback or not text:
@@ -164,7 +208,7 @@ class Agent:
                     total_tokens=0,
                     started_at=model_started,
                     status="failed",
-                    error=str(exc),
+                    error=format_exception(exc),
                 )
                 if attempt < recovery_attempts and not "".join(parser.visible_parts).strip():
                     await self._compress_context()
@@ -186,7 +230,7 @@ class Agent:
                     total_tokens=0,
                     started_at=model_started,
                     status="failed",
-                    error=str(exc),
+                    error=format_exception(exc),
                 )
                 raise
 
@@ -399,7 +443,9 @@ class Agent:
         return self.store.get_run_trace(selected) if selected else None
 
     async def inspect_mcp(self) -> dict[str, Any]:
-        await self.tool_provider.start()
+        owned_lifecycle = not self._started
+        if owned_lifecycle:
+            await self.start()
         try:
             status = self.tool_provider.status()
             status["providers"] = [
@@ -407,14 +453,247 @@ class Agent:
             ]
             return status
         finally:
-            await self.tool_provider.close()
+            if owned_lifecycle:
+                await self.close()
 
     async def list_available_tools(self) -> list[str]:
-        await self.tool_provider.start()
+        owned_lifecycle = not self._started
+        if owned_lifecycle:
+            await self.start()
         try:
             return self.tool_provider.tool_names()
         finally:
-            await self.tool_provider.close()
+            if owned_lifecycle:
+                await self.close()
+
+    async def _prepare_tool_selection(self, prompt: str) -> dict[str, Any]:
+        all_schemas = [
+            schema
+            for schema in self.tool_provider.schemas()
+            if schema.get("function", {}).get("name") != "tool_search"
+        ]
+        catalog = [
+            item
+            for item in self.tool_provider.catalog()
+            if item.get("name") != "tool_search"
+        ]
+        available = {str(item.get("name")) for item in catalog}
+        schema_tokens = len(json.dumps(all_schemas, ensure_ascii=False)) // 4
+        config = self.config.get("tool_selection", default={}) or {}
+        min_tools = max(1, int(config.get("min_tools", 16)))
+        min_schema_tokens = max(1, int(config.get("min_schema_tokens", 3000)))
+        max_selected = max(1, int(config.get("max_selected", 12)))
+        enabled = bool(config.get("enabled", True))
+        triggered = enabled and (
+            len(all_schemas) >= min_tools or schema_tokens >= min_schema_tokens
+        )
+
+        if not triggered:
+            self._tool_selection_active = False
+            self._turn_tool_names = set(available)
+            result = {
+                "mode": "all",
+                "catalog_tools": len(all_schemas),
+                "schema_tokens": schema_tokens,
+                "selected": sorted(self._turn_tool_names),
+                "selector_tokens": 0,
+            }
+            self._last_tool_selection = result
+            self._trace_event("tool_selection", result, turn=0)
+            return result
+
+        self._tool_selection_active = True
+        sticky_limit = max(0, int(config.get("sticky_recent", 4)))
+        sticky = [
+            name
+            for name in self._recent_tool_names[-sticky_limit:]
+            if name in available
+        ] if sticky_limit else []
+        always = [
+            str(name)
+            for name in config.get("always_include", [])
+            if str(name) in available
+        ]
+        selector_tokens = 0
+        selector_model: str | None = None
+        selector_started = monotonic()
+        error: str | None = None
+        try:
+            selector_llm = self._get_utility_llm()
+            selector_model = selector_llm.model
+            discovered_skills = self.skill_manager.discover()
+            active_skill_context = [
+                {
+                    "name": name,
+                    "description": discovered_skills[name].description,
+                }
+                for name in self.active_skill_names
+                if name in discovered_skills
+            ]
+            response = await selector_llm.chat(
+                build_tool_selection_messages(
+                    prompt,
+                    catalog,
+                    active_skills=active_skill_context,
+                    recent_tools=sticky,
+                    conversation_context=self._tool_selection_conversation_context(),
+                    max_selected=max_selected,
+                ),
+                tools=None,
+                cancel_event=self._cancel_event,
+            )
+            selector_tokens = int(
+                (response.get("usage") or {}).get("total_tokens", 0) or 0
+            )
+            self._total_tokens += selector_tokens
+            self._utility_tokens += selector_tokens
+            raw = selector_llm.extract_text(response) or ""
+            filtered = filter_reasoning_text(
+                raw,
+                max_reasoning_chars=int(
+                    self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
+                ),
+            )
+            selection = parse_tool_selection(
+                filtered.text,
+                catalog,
+                max_selected=max_selected,
+            )
+            selected = selection.names
+            reason = selection.reason
+            mode = "llm"
+            self._record_model_call(
+                model=selector_llm.model,
+                purpose="tool_selection",
+                total_tokens=selector_tokens,
+                started_at=selector_started,
+                status="completed",
+            )
+        except asyncio.CancelledError:
+            if selector_model:
+                self._record_model_call(
+                    model=selector_model,
+                    purpose="tool_selection",
+                    total_tokens=selector_tokens,
+                    started_at=selector_started,
+                    status="cancelled",
+                )
+            raise
+        except Exception as exc:
+            error = format_exception(exc)
+            if selector_model:
+                self._record_model_call(
+                    model=selector_model,
+                    purpose="tool_selection",
+                    total_tokens=selector_tokens,
+                    started_at=selector_started,
+                    status="failed",
+                    error=error,
+                )
+            selected = [
+                item["name"]
+                for item in rank_tool_catalog(prompt, catalog, limit=max_selected)
+            ]
+            reason = "deterministic catalog ranking"
+            mode = "fallback"
+
+        ordered: list[str] = []
+        for name in [*always, *sticky, *selected]:
+            if name in available and name not in ordered:
+                ordered.append(name)
+            if len(ordered) >= max_selected:
+                break
+        self._turn_tool_names = set(ordered)
+        result = {
+            "mode": mode,
+            "catalog_tools": len(all_schemas),
+            "schema_tokens": schema_tokens,
+            "selected": ordered,
+            "selector_model": selector_model,
+            "selector_tokens": selector_tokens,
+            "reason": reason,
+        }
+        if error:
+            result["fallback_reason"] = error
+        self._last_tool_selection = result
+        self._trace_event("tool_selection", result, turn=0)
+        return result
+
+    def _tool_selection_conversation_context(self) -> list[dict[str, str]]:
+        context: list[dict[str, str]] = []
+        summary = next(
+            (
+                message
+                for message in self._messages
+                if str(message.get("content") or "").startswith(
+                    "[Previous conversation summary]"
+                )
+            ),
+            None,
+        )
+        candidates = list(self._messages[:-1][-6:])
+        if summary is not None and summary not in candidates:
+            candidates.insert(0, summary)
+        for message in candidates:
+            role = str(message.get("role") or "")
+            content = str(message.get("content") or "").strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            context.append({
+                "role": role,
+                "content": truncate_string(content, 800),
+            })
+        return context
+
+    def _selected_tool_schemas(self) -> list[dict[str, Any]]:
+        schemas = self.tool_provider.schemas()
+        if not self._tool_selection_active:
+            return [
+                schema
+                for schema in schemas
+                if schema.get("function", {}).get("name") != "tool_search"
+            ]
+        allowed = set(self._turn_tool_names)
+        allowed.add("tool_search")
+        return [
+            schema
+            for schema in schemas
+            if schema.get("function", {}).get("name") in allowed
+        ]
+
+    def _search_and_activate_tools(
+        self,
+        query: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        catalog = [
+            item
+            for item in self.tool_provider.catalog()
+            if item.get("name") != "tool_search"
+        ]
+        matches = rank_tool_catalog(query, catalog, limit=limit)
+        for item in matches:
+            self._turn_tool_names.add(str(item["name"]))
+        self._trace_event(
+            "tool_search",
+            {"query": query, "activated": [item["name"] for item in matches]},
+        )
+        return [
+            {
+                "name": item["name"],
+                "description": item.get("description", ""),
+                "category": item.get("category", "unknown"),
+            }
+            for item in matches
+        ]
+
+    def _remember_tool(self, tool_name: str) -> None:
+        if tool_name == "tool_search":
+            return
+        if tool_name in self._recent_tool_names:
+            self._recent_tool_names.remove(tool_name)
+        self._recent_tool_names.append(tool_name)
+        self._recent_tool_names = self._recent_tool_names[-20:]
 
     def list_skills(self) -> list[dict[str, Any]]:
         discovered = self.skill_manager.discover()
@@ -466,6 +745,9 @@ class Agent:
         self._total_tokens = 0
         self._utility_tokens = 0
         self._last_compaction = None
+        self._last_tool_selection = None
+        self._turn_tool_names.clear()
+        self._recent_tool_names.clear()
         self._session_approvals.clear()
         self.run_state = AgentRunState()
         if clear_skills:
@@ -496,6 +778,9 @@ class Agent:
         self._total_tokens = 0
         self._utility_tokens = 0
         self._last_compaction = None
+        self._last_tool_selection = None
+        self._turn_tool_names.clear()
+        self._recent_tool_names.clear()
         self._session_approvals.clear()
         repaired = self._repair_incomplete_tool_transactions()
         self._refresh_system_message()
@@ -738,7 +1023,7 @@ class Agent:
                 total_tokens=0,
                 started_at=review_started,
                 status="failed",
-                error=str(exc),
+                error=format_exception(exc),
             )
             raise
         usage = review_response.get("usage", {})
@@ -766,6 +1051,9 @@ class Agent:
         skills: list[str] | None = None,
         stream_callback: Any = None,
     ) -> str:
+        owned_lifecycle = not self._started
+        if owned_lifecycle:
+            await self.start()
         try:
             return await self._run(
                 prompt,
@@ -782,11 +1070,12 @@ class Agent:
                 self._transition(
                     RunStatus.FAILED,
                     turn=self.run_state.turn,
-                    error=str(exc),
+                    error=format_exception(exc),
                 )
             raise
         finally:
-            await self.tool_provider.close()
+            if owned_lifecycle:
+                await self.close()
             self._finish_trace()
             self._current_run_id = None
             self._active_task = None
@@ -810,19 +1099,17 @@ class Agent:
         Returns:
             最终响应文本
         """
-        self._init_llm()
         self._cancel_event = asyncio.Event()
         self._active_task = asyncio.current_task()
         self._refresh_system_message(memory_entries, skills)
         self._ensure_session(prompt, memory_entries, skills)
         self.run_state = AgentRunState()
         self._start_trace(prompt)
-        await self.tool_provider.start()
         self._trace_event("tool_providers", self.tool_provider.status(), turn=0)
+        await self._prepare_tool_selection(prompt)
 
         max_turns = self.config.get_agent_config().get("max_turns", 50)
         compression_threshold = self.config.get_agent_config().get("compression_threshold", 0.80)
-        tool_schemas = self.tool_provider.schemas()
 
         final_text = ""
 
@@ -841,6 +1128,7 @@ class Agent:
                 if estimated > context_limit * compression_threshold:
                     await self._compress_context()
 
+                tool_schemas = self._selected_tool_schemas()
                 (
                     response,
                     text,
@@ -866,7 +1154,10 @@ class Agent:
                 final_text = error_msg
                 break
             except Exception as e:
-                error_msg = f"LLM call failed (turn {self._turn_count}): {e}"
+                error_msg = (
+                    f"LLM call failed (turn {self._turn_count}): "
+                    f"{format_exception(e)}"
+                )
                 self._transition(
                     RunStatus.FAILED,
                     turn=request_turn,
@@ -983,6 +1274,7 @@ class Agent:
                     self._messages.append(tool_msg)
                     self._persist_message("tool", tool_result, tool_call_id=tc.get("id", ""))
                     self._persist_tool_call(tool_name, persisted_args, tool_result)
+                    self._remember_tool(tool_name)
                     self._trace_event(
                         "tool_call",
                         {
@@ -1099,11 +1391,11 @@ class Agent:
                         total_tokens=summary_tokens,
                         started_at=locals().get("summary_started", monotonic()),
                         status="failed",
-                        error=str(exc),
+                        error=format_exception(exc),
                     )
                 if not fallback_enabled:
                     raise
-                error = str(exc)
+                error = format_exception(exc)
                 summary = summarize_messages(old_messages)
                 mode = "fallback"
         else:
@@ -1180,6 +1472,7 @@ class Agent:
         return {
             "session_id": self.session_id,
             "run_status": self.run_state.status.value,
+            "runtime_started": self._started,
             "model": self.config.get("model", "name", default="unknown"),
             "provider": self.config.get("model", "provider", default="openai-compatible"),
             "model_api": self.config.get("model", "api", default="auto"),
@@ -1200,6 +1493,9 @@ class Agent:
             "storage_enabled": bool(storage.get("enabled", True)),
             "storage_path": storage.get("path") if storage.get("enabled", True) else None,
             "last_compaction": dict(self._last_compaction) if self._last_compaction else None,
+            "last_tool_selection": (
+                dict(self._last_tool_selection) if self._last_tool_selection else None
+            ),
         }
 
     def get_messages(self) -> list[dict]:

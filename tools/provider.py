@@ -56,6 +56,18 @@ class ToolProvider(ABC):
     def status(self) -> dict[str, Any]:
         return {"name": self.name, "connected": True, "tools": self.tool_names()}
 
+    def catalog(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": schema["function"]["name"],
+                "description": schema["function"].get("description", ""),
+                "category": self.name,
+                "provider": self.name,
+                "risk": "medium",
+            }
+            for schema in self.schemas()
+        ]
+
 
 class LocalToolProvider(ToolProvider):
     name = "local"
@@ -69,6 +81,9 @@ class LocalToolProvider(ToolProvider):
 
     def tool_names(self) -> list[str]:
         return self.registry.list_tools(self.toolsets)
+
+    def catalog(self) -> list[dict[str, Any]]:
+        return self.registry.get_catalog(self.toolsets)
 
     def owns(self, tool_name: str) -> bool:
         return tool_name in self.tool_names()
@@ -138,6 +153,18 @@ class TaskToolProvider(ToolProvider):
     def tool_names(self) -> list[str]:
         return ["task_list", "task_create", "task_update"]
 
+    def catalog(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": schema["function"]["name"],
+                "description": schema["function"].get("description", ""),
+                "category": "task",
+                "provider": self.name,
+                "risk": "low",
+            }
+            for schema in self._schemas
+        ]
+
     def owns(self, tool_name: str) -> bool:
         return tool_name in self.tool_names()
 
@@ -163,6 +190,79 @@ class TaskToolProvider(ToolProvider):
                 return ToolResult.failure(f"Unknown task tool: {tool_name}").to_json()
             return ToolResult.success(json.dumps(value, ensure_ascii=False)).to_json()
         except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            return ToolResult.failure(str(exc)).to_json()
+
+
+class ToolSearchProvider(ToolProvider):
+    """Always-small meta tool that activates omitted tools for the current turn."""
+
+    name = "tool_search"
+
+    def __init__(
+        self,
+        search: Callable[[str, int], list[dict[str, Any]]],
+        *,
+        default_limit: int = 5,
+    ) -> None:
+        self._search = search
+        self._default_limit = max(1, min(int(default_limit), 20))
+        self._schema = _function_schema(
+            "tool_search",
+            "Search the available tool catalog and activate matching tools for the next model call.",
+            {
+                "query": {
+                    "type": "string",
+                    "description": "Capability needed, such as database query or file editing",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum matches to activate",
+                    "default": self._default_limit,
+                },
+            },
+            ["query"],
+        )
+
+    def schemas(self) -> list[dict[str, Any]]:
+        return [self._schema]
+
+    def tool_names(self) -> list[str]:
+        return ["tool_search"]
+
+    def catalog(self) -> list[dict[str, Any]]:
+        return [{
+            "name": "tool_search",
+            "description": self._schema["function"]["description"],
+            "category": "core",
+            "provider": self.name,
+            "risk": "low",
+        }]
+
+    def owns(self, tool_name: str) -> bool:
+        return tool_name == "tool_search"
+
+    def assess_risk(self, tool_name: str, args: dict, context: ToolContext) -> ToolRisk:
+        return ToolRisk(RiskLevel.LOW, "Read-only tool catalog search", tool_name)
+
+    async def call(
+        self,
+        tool_name: str,
+        args: dict,
+        context: ToolContext,
+        *,
+        approved: bool = False,
+    ) -> str:
+        try:
+            query = str(args.get("query") or "").strip()
+            limit = max(1, min(int(args.get("limit", self._default_limit)), 20))
+            if not query:
+                raise ValueError("tool_search query cannot be empty")
+            matches = self._search(query, limit)
+            return ToolResult.success(
+                json.dumps(matches, ensure_ascii=False),
+                activated=[item["name"] for item in matches],
+            ).to_json()
+        except (TypeError, ValueError, RuntimeError) as exc:
             return ToolResult.failure(str(exc)).to_json()
 
 
@@ -259,6 +359,18 @@ class MCPServerProvider(ToolProvider):
 
     def tool_names(self) -> list[str]:
         return list(self._tools)
+
+    def catalog(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": exposed_name,
+                "description": str(tool.get("description") or ""),
+                "category": f"mcp:{self.name}",
+                "provider": self.name,
+                "risk": self.risk.value,
+            }
+            for exposed_name, tool in self._tools.items()
+        ]
 
     def owns(self, tool_name: str) -> bool:
         return tool_name in self._tools
@@ -409,6 +521,9 @@ class CompositeToolProvider(ToolProvider):
     def tool_names(self) -> list[str]:
         return [name for provider in self.providers for name in provider.tool_names()]
 
+    def catalog(self) -> list[dict[str, Any]]:
+        return [item for provider in self.providers for item in provider.catalog()]
+
     def owns(self, tool_name: str) -> bool:
         return any(provider.owns(tool_name) for provider in self.providers)
 
@@ -449,10 +564,13 @@ def create_tool_provider(
     workspace: str | Path,
     *,
     task_provider: ToolProvider | None = None,
+    search_provider: ToolProvider | None = None,
 ) -> CompositeToolProvider:
     providers: list[ToolProvider] = [LocalToolProvider(registry, toolsets)]
     if task_provider is not None:
         providers.append(task_provider)
+    if search_provider is not None:
+        providers.append(search_provider)
     for name, server_config in (mcp_servers or {}).items():
         if not isinstance(server_config, dict) or not server_config.get("enabled", True):
             continue

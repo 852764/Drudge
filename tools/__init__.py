@@ -9,6 +9,7 @@ from .provider import (
     LocalToolProvider,
     MCPServerProvider,
     TaskToolProvider,
+    ToolSearchProvider,
     ToolProvider,
     create_tool_provider,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "LocalToolProvider",
     "MCPServerProvider",
     "TaskToolProvider",
+    "ToolSearchProvider",
     "CompositeToolProvider",
     "create_tool_provider",
 ]

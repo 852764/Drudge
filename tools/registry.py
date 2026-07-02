@@ -243,6 +243,24 @@ class ToolRegistry:
                     names.append(name)
         return names
 
+    def get_catalog(self, toolsets: list[str] | None = None) -> list[dict[str, Any]]:
+        """Return trusted routing metadata without tool parameter schemas."""
+        catalog = []
+        for name, info in self._tools.items():
+            if toolsets is not None and info["toolset"] not in toolsets:
+                continue
+            if info["check_fn"] is not None and not info["check_fn"]():
+                continue
+            function = info["schema"]["function"]
+            catalog.append({
+                "name": name,
+                "description": function.get("description", ""),
+                "category": info["toolset"],
+                "provider": "local",
+                "risk": info["risk"].value,
+            })
+        return catalog
+
 
 # 全局单例
 registry = ToolRegistry()
