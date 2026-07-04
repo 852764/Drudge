@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 from agent import Agent, AgentRuntime
+from agent.cli_renderer import CliRenderer
 from agent.llm import create_client
 from config import ConfigManager, get_config
 from tools import ApprovalDecision, ApprovalRequest
@@ -41,40 +42,41 @@ class ConsoleApproval:
         return ApprovalDecision.DENY
 
 
-class _StreamPrinter:
-    def __init__(self) -> None:
-        self.seen = False
-        self.parts: list[str] = []
-
-    def __call__(self, delta: str) -> None:
-        self.seen = True
-        self.parts.append(delta)
-        print(delta, end="", flush=True)
+def _make_renderer(config) -> CliRenderer:
+    return CliRenderer(
+        pretty=bool(config.get("display", "pretty_cli", default=True)),
+    )
 
 
-async def _run_and_print(agent: Agent, query: str) -> str:
-    printer = _StreamPrinter()
-    response = await agent.run(query, stream_callback=printer)
-    if printer.seen:
-        print()
-        streamed = "".join(printer.parts).rstrip()
-        if response.strip() and not streamed.endswith(response.rstrip()):
-            print(response)
-    else:
-        print(response)
+def _attach_renderer(agent: Agent, renderer: CliRenderer) -> None:
+    agent.tool_log_callback = renderer.print_tool_event
+
+
+async def _run_and_print(agent: Agent, query: str, renderer: CliRenderer) -> str:
+    printer = renderer.make_stream_printer("Assistant")
+    ticker = renderer.make_activity_ticker("Thinking")
+    task = asyncio.create_task(ticker.run())
+    response = ""
+    try:
+        response = await agent.run(query, stream_callback=printer)
+    finally:
+        ticker.stop()
+        await asyncio.gather(task, return_exceptions=True)
+    printer.finish(response)
     return response
 
 
-async def _run_runtime_and_print(runtime: AgentRuntime, query: str) -> str:
-    printer = _StreamPrinter()
-    response = await runtime.run_turn(query, stream_callback=printer)
-    if printer.seen:
-        print()
-        streamed = "".join(printer.parts).rstrip()
-        if response.strip() and not streamed.endswith(response.rstrip()):
-            print(response)
-    else:
-        print(response)
+async def _run_runtime_and_print(runtime: AgentRuntime, query: str, renderer: CliRenderer) -> str:
+    printer = renderer.make_stream_printer("Assistant")
+    ticker = renderer.make_activity_ticker("Thinking")
+    task = asyncio.create_task(ticker.run())
+    response = ""
+    try:
+        response = await runtime.run_turn(query, stream_callback=printer)
+    finally:
+        ticker.stop()
+        await asyncio.gather(task, return_exceptions=True)
+    printer.finish(response)
     return response
 
 
@@ -202,16 +204,18 @@ def _configure_agent_extensions(
     agent: Agent,
     resume_id: str | None,
     skill_names: list[str] | None,
+    renderer: CliRenderer,
 ) -> None:
     if resume_id:
         session = agent.resume_session(resume_id)
-        print(
+        renderer.print_note(
             f"Resumed session {session['id']}: {session['message_count']} messages, "
-            f"{session['repaired_tool_calls']} repaired tool calls"
+            f"{session['repaired_tool_calls']} repaired tool calls",
+            level="success",
         )
     for name in skill_names or []:
         skill = agent.activate_skill(name)
-        print(f"Activated skill: {skill.name} ({skill.description})")
+        renderer.print_note(f"Activated skill: {skill.name} ({skill.description})", level="success")
 
 
 async def run_query(
@@ -228,6 +232,7 @@ async def run_query(
 ) -> None:
     """执行单次查询"""
     config = get_config(config_path, codex_config_path)
+    renderer = _make_renderer(config)
 
     if toolsets:
         config.override("toolsets", value=toolsets)
@@ -241,32 +246,27 @@ async def run_query(
         config.override("security", "approval_mode", value=approval_mode)
     _validate_runtime_config(config)
     agent = Agent(config, approval_callback=ConsoleApproval())
+    _attach_renderer(agent, renderer)
 
-    print(f"Drudge v{VERSION}")
-    print(f"Model: {config.get('model', 'name')}")
-    if config.codex_config_path:
-        print(f"Codex config: {config.codex_config_path}")
-    print(f"Toolsets: {', '.join(config.get_toolsets())}")
-    print("-" * 60)
+    renderer.print_banner(
+        version=VERSION,
+        model=config.get("model", "name"),
+        toolsets=config.get_toolsets(),
+        codex_config_path=config.codex_config_path,
+    )
 
     try:
-        _configure_agent_extensions(agent, resume_id, skill_names)
-        print()
-        await _run_and_print(agent, query)
+        _configure_agent_extensions(agent, resume_id, skill_names, renderer)
+        await _run_and_print(agent, query, renderer)
     except asyncio.CancelledError:
-        print("\nCancelled.", file=sys.stderr)
+        renderer.print_note("Cancelled.", level="warning", error=True)
     except Exception as e:
-        print(f"\nError: {e}", file=sys.stderr)
+        renderer.print_note(f"Error: {e}", level="error", error=True)
         sys.exit(1)
 
     usage = agent.get_token_usage()
     if config.get("display", "show_cost"):
-        print(
-            f"\n--- Tokens: {usage['total_tokens']} | Utility: {usage['utility_tokens']} "
-            f"| Turns: {usage['turns']} ---"
-        )
-    if agent.session_id:
-        print(f"Session: {agent.session_id}")
+        renderer.print_usage(usage, session_id=agent.session_id)
 
 
 async def show_models(
@@ -296,7 +296,7 @@ async def show_models(
         print(item)
 
 
-async def show_status(config, agent: Agent, *, as_json: bool = False) -> dict:
+async def show_status(config, agent: Agent, *, as_json: bool = False, renderer: CliRenderer | None = None) -> dict:
     import json
 
     result = {"local": agent.get_status(), "account_usage": None, "account_usage_error": None}
@@ -312,47 +312,7 @@ async def show_status(config, agent: Agent, *, as_json: bool = False) -> dict:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return result
 
-    local = result["local"]
-    print("Drudge status")
-    print(f"Session: {local['session_id'] or '(new)'}")
-    print(f"Run status: {local['run_status']}")
-    print(f"Runtime: {'started' if local['runtime_started'] else 'scoped/not started'}")
-    print(f"Model: {local['model']} ({local['provider']}, {local['model_api']})")
-    utility_suffix = "configured" if local["utility_model_configured"] else "primary reused"
-    print(f"Utility model: {local['utility_model']} ({utility_suffix})")
-    print(f"Turns: {local['turns']} | Messages: {local['message_count']}")
-    print(
-        f"Tokens this process: {local['tokens_this_process']} "
-        f"(utility: {local['utility_tokens_this_process']})"
-    )
-    if local["context_limit"]:
-        used = local["context_used_percent"] or 0.0
-        print(
-            f"Context: ~{local['estimated_context_tokens']}/{local['context_limit']} "
-            f"tokens ({max(0.0, 100.0 - used):.1f}% left)"
-        )
-    print(f"Workspace: {local['workspace']}")
-    print(f"Approval mode: {local['approval_mode']}")
-    print(f"Active skills: {', '.join(local['active_skills']) or '(none)'}")
-    print(f"Open tasks: {local['open_tasks']}")
-    print(f"MCP servers: {', '.join(local['mcp_servers']) or '(none)'}")
-    selection = local.get("last_tool_selection")
-    if selection:
-        print(
-            f"Tool selection: {selection['mode']} "
-            f"({len(selection['selected'])}/{selection['catalog_tools']} tools, "
-            f"~{selection['schema_tokens']} schema tokens)"
-        )
-    if result["account_usage"]:
-        from agent.codex_usage import format_codex_usage
-
-        print("\nCodex account usage")
-        for line in format_codex_usage(result["account_usage"]):
-            print(line)
-    elif result["account_usage_error"]:
-        print(f"\nCodex account usage unavailable: {result['account_usage_error']}")
-    else:
-        print("\nAccount limits: unavailable for the current non-Codex provider")
+    (renderer or _make_renderer(config)).print_status(result)
     return result
 
 
@@ -368,6 +328,7 @@ async def run_status(
     as_json: bool = False,
 ) -> None:
     config = get_config(config_path, codex_config_path)
+    renderer = _make_renderer(config)
     if model:
         config.override("model", "name", value=model)
     if no_tools:
@@ -379,11 +340,12 @@ async def run_status(
     if config.get("model", "auth_mode") == "codex_oauth":
         _validate_runtime_config(config)
     agent = Agent(config, approval_callback=ConsoleApproval())
+    _attach_renderer(agent, renderer)
     if resume_id:
         agent.resume_session(resume_id)
     for name in skill_names or []:
         agent.activate_skill(name)
-    await show_status(config, agent, as_json=as_json)
+    await show_status(config, agent, as_json=as_json, renderer=renderer)
 
 
 def run_interactive(
@@ -415,6 +377,7 @@ def run_interactive(
         return
 
     config = get_config(config_path, codex_config_path)
+    renderer = _make_renderer(config)
     if model:
         config.override("model", "name", value=model)
     if no_tools:
@@ -425,8 +388,9 @@ def run_interactive(
         config.override("security", "approval_mode", value=approval_mode)
     _validate_runtime_config(config)
     agent = Agent(config, approval_callback=ConsoleApproval())
+    _attach_renderer(agent, renderer)
     try:
-        _configure_agent_extensions(agent, resume_id, skill_names)
+        _configure_agent_extensions(agent, resume_id, skill_names, renderer)
     except (KeyError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return
@@ -435,16 +399,17 @@ def run_interactive(
         "prompt": "ansicyan bold",
     })
 
-    print(f"Drudge v{VERSION}")
-    print(f"Model: {config.get('model', 'name')} | Toolsets: {', '.join(config.get_toolsets())}")
-    if config.codex_config_path:
-        print(f"Codex config: {config.codex_config_path}")
-    print("Type /quit to exit, /help for commands, /tools to list tools")
-    print("-" * 60)
+    renderer.print_banner(
+        version=VERSION,
+        model=config.get("model", "name"),
+        toolsets=config.get_toolsets(),
+        codex_config_path=config.codex_config_path,
+        subtitle="Type /quit to exit, /help for commands, /tools to list tools",
+    )
 
     session = PromptSession(style=style)
 
-    asyncio.run(_interactive_loop(config, agent, session=session))
+    asyncio.run(_interactive_loop(config, agent, renderer=renderer, session=session))
 
 
 def _run_simple_interactive(
@@ -459,6 +424,7 @@ def _run_simple_interactive(
 ) -> None:
     """简单交互模式（不依赖 prompt_toolkit）"""
     config = get_config(config_path, codex_config_path)
+    renderer = _make_renderer(config)
     if model:
         config.override("model", "name", value=model)
     if no_tools:
@@ -469,23 +435,25 @@ def _run_simple_interactive(
         config.override("security", "approval_mode", value=approval_mode)
     _validate_runtime_config(config)
     agent = Agent(config, approval_callback=ConsoleApproval())
+    _attach_renderer(agent, renderer)
     try:
-        _configure_agent_extensions(agent, resume_id, skill_names)
+        _configure_agent_extensions(agent, resume_id, skill_names, renderer)
     except (KeyError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return
 
-    print(f"Drudge v{VERSION}")
-    print(f"Model: {config.get('model', 'name')}")
-    if config.codex_config_path:
-        print(f"Codex config: {config.codex_config_path}")
-    print("Type /quit to exit")
-    print("-" * 60)
+    renderer.print_banner(
+        version=VERSION,
+        model=config.get("model", "name"),
+        toolsets=config.get_toolsets(),
+        codex_config_path=config.codex_config_path,
+        subtitle="Type /quit to exit",
+    )
 
-    asyncio.run(_interactive_loop(config, agent, session=None))
+    asyncio.run(_interactive_loop(config, agent, renderer=renderer, session=None))
 
 
-async def _interactive_loop(config, agent: Agent, *, session=None) -> None:
+async def _interactive_loop(config, agent: Agent, *, renderer: CliRenderer, session=None) -> None:
     runtime = AgentRuntime(agent)
     async with runtime:
         while True:
@@ -501,70 +469,41 @@ async def _interactive_loop(config, agent: Agent, *, session=None) -> None:
             if not user_input.strip():
                 continue
             if user_input.startswith("/"):
-                if await _handle_command(user_input, config, agent):
+                if await _handle_command(user_input, config, agent, renderer=renderer):
                     break
                 continue
 
             try:
-                await _run_runtime_and_print(runtime, user_input)
+                await _run_runtime_and_print(runtime, user_input, renderer)
             except KeyboardInterrupt:
                 runtime.cancel()
-                print("\nCancelled. Ready for the next prompt.")
+                renderer.print_note("Cancelled. Ready for the next prompt.", level="warning")
                 continue
 
             usage = agent.get_token_usage()
             if config.get("display", "show_cost"):
-                print(
-                    f"Tokens: {usage['total_tokens']} | Utility: {usage['utility_tokens']} "
-                    f"| Turns: {usage['turns']}"
-                )
-            if agent.session_id:
-                print(f"Session: {agent.session_id}")
+                renderer.print_usage(usage, session_id=agent.session_id)
 
 
-async def _handle_command(cmd: str, config, agent: Agent | None = None) -> bool:
+async def _handle_command(cmd: str, config, agent: Agent | None = None, *, renderer: CliRenderer | None = None) -> bool:
     """处理 slash 命令"""
+    renderer = renderer or _make_renderer(config)
     parts = cmd.strip().split()
     command = parts[0].lower()
 
     if command in ("/quit", "/exit", "/q"):
-        print("Goodbye!")
+        renderer.print_note("Goodbye!", level="info")
         return True
     elif command == "/help":
-        print("Commands:")
-        print("  /quit, /exit, /q    Exit Drudge")
-        print("  /help               Show this help")
-        print("  /tools              List available tools")
-        print("  /mcp                Inspect configured MCP stdio servers")
-        print("  /config             Show current config")
-        print("  /models             List provider models")
-        print("  /sessions           List saved sessions")
-        print("  /history [id]       Show saved messages")
-        print("  /runs               List recent runs")
-        print("  /trace [run_id]     Show a persisted run trace")
-        print("  /tasks [all]        List persistent session tasks")
-        print("  /task add <title>   Create a persistent task")
-        print("  /task start|done|cancel|reopen <id>")
-        print("  /status             Show session, context, and account limits")
-        print("  /compact            Compact older conversation context")
-        print("  /resume <id>        Resume a saved session")
-        print("  /new                Start a new session")
-        print("  /skills             List discovered skills")
-        print("  /skill <name>       Activate a skill")
-        print("  /skill off <name>   Deactivate a skill")
-        print("  /skill show <name>  Show skill metadata")
-        print("  /skill clear        Deactivate all skills")
-        print("  /clear              Clear screen")
+        renderer.print_help()
     elif command == "/tools":
         names = await agent.list_available_tools() if agent else []
-        print("Available tools:")
-        for name in sorted(names):
-            print(f"  - {name}")
+        renderer.print_list("Available Tools", sorted(names))
     elif command == "/mcp":
         if agent is None:
-            print("Agent is unavailable.")
+            renderer.print_note("Agent is unavailable.", level="warning")
         else:
-            _show_mcp(await agent.inspect_mcp())
+            _show_mcp(await agent.inspect_mcp(), renderer=renderer)
     elif command == "/config":
         import yaml
         print(yaml.dump(config.as_safe_dict(), default_flow_style=False, allow_unicode=True))
@@ -579,31 +518,35 @@ async def _handle_command(cmd: str, config, agent: Agent | None = None) -> bool:
         else:
             _show_history(config, session_id)
     elif command == "/runs":
-        _show_runs(agent)
+        _show_runs(agent, renderer=renderer)
     elif command == "/trace":
         _show_trace(agent, parts[1] if len(parts) > 1 else None)
     elif command == "/tasks":
-        _show_tasks(agent, include_closed=len(parts) > 1 and parts[1].lower() == "all")
+        _show_tasks(agent, include_closed=len(parts) > 1 and parts[1].lower() == "all", renderer=renderer)
     elif command == "/task":
         _handle_task_command(parts[1:], agent)
     elif command in ("/status", "/usage"):
         if agent is None:
-            print("Agent is unavailable.")
+            renderer.print_note("Agent is unavailable.", level="warning")
         else:
-            await show_status(config, agent)
+            await show_status(config, agent, renderer=renderer)
     elif command == "/compact":
         if agent is None:
-            print("Agent is unavailable.")
+            renderer.print_note("Agent is unavailable.", level="warning")
         else:
             result = await agent.compact_context()
-            print(
+            renderer.print_note(
                 f"Context compacted: {result['before_messages']} -> {result['after_messages']} messages, "
                 f"~{result['before_tokens']} -> ~{result['after_tokens']} tokens "
                 f"(mode={result['mode']}, model={result.get('summary_model') or 'deterministic'}, "
-                f"summary_tokens={result['summary_tokens']})"
+                f"summary_tokens={result['summary_tokens']})",
+                level="success",
             )
             if result.get("fallback_reason"):
-                print(f"LLM summary failed; used deterministic fallback: {result['fallback_reason']}")
+                renderer.print_note(
+                    f"LLM summary failed; used deterministic fallback: {result['fallback_reason']}",
+                    level="warning",
+                )
     elif command == "/resume":
         if agent is None:
             print("Agent is unavailable.")
@@ -626,61 +569,69 @@ async def _handle_command(cmd: str, config, agent: Agent | None = None) -> bool:
             agent.new_session()
         print("Started a new session. Active skills were kept.")
     elif command == "/skills":
-        _show_skills(agent)
+        _show_skills(agent, renderer=renderer)
     elif command == "/skill":
         _handle_skill_command(parts[1:], agent)
     elif command == "/clear":
         import os
         os.system("cls" if os.name == "nt" else "clear")
     else:
-        print(f"Unknown command: {command}. Type /help for available commands.")
+        renderer.print_note(f"Unknown command: {command}. Type /help for available commands.", level="warning")
     return False
 
 
-def _show_skills(agent: Agent | None) -> None:
+def _show_skills(agent: Agent | None, *, renderer: CliRenderer | None = None) -> None:
+    renderer = renderer or CliRenderer(pretty=False)
     if agent is None:
-        print("Agent is unavailable.")
+        renderer.print_note("Agent is unavailable.", level="warning")
         return
     skills = agent.list_skills()
     if not skills:
-        print("No skills found under .drudge/skills/*/SKILL.md")
+        renderer.print_note("No skills found under .drudge/skills/*/SKILL.md", level="info")
         return
-    for skill in skills:
-        marker = "*" if skill["active"] else " "
-        print(f"[{marker}] {skill['name']}: {skill['description']}")
+    renderer.print_list(
+        "Skills",
+        [f"[{'*' if skill['active'] else ' '}] {skill['name']}: {skill['description']}" for skill in skills],
+    )
 
 
-def _show_mcp(status: dict) -> None:
+def _show_mcp(status: dict, *, renderer: CliRenderer | None = None) -> None:
+    renderer = renderer or CliRenderer(pretty=False)
     providers = status.get("providers") or []
     if not providers:
-        print("No MCP servers configured.")
+        renderer.print_note("No MCP servers configured.", level="info")
         return
+    items: list[str] = []
     for item in providers:
         state = "connected" if item.get("connected") else "unavailable"
-        print(f"{item['name']}: {state}")
+        items.append(f"{item['name']}: {state}")
         if item.get("error"):
-            print(f"  error: {item['error']}")
+            items.append(f"error: {item['error']}")
         for tool in item.get("tools") or []:
-            print(f"  - {tool}")
+            items.append(f"- {tool}")
+    renderer.print_list("MCP Servers", items)
 
 
-def _show_runs(agent: Agent | None) -> None:
+def _show_runs(agent: Agent | None, *, renderer: CliRenderer | None = None) -> None:
+    renderer = renderer or CliRenderer(pretty=False)
     if agent is None:
-        print("Agent is unavailable.")
+        renderer.print_note("Agent is unavailable.", level="warning")
         return
     try:
         runs = agent.list_runs()
     except RuntimeError as exc:
-        print(str(exc))
+        renderer.print_note(str(exc), level="warning")
         return
     if not runs:
-        print("No persisted runs for this session.")
+        renderer.print_note("No persisted runs for this session.", level="info")
         return
-    for run in runs:
-        print(
-            f"{run['id']}  {run['status']:<10}  {run['model']}  "
-            f"{run['started_at']}  {run['prompt'][:60]}"
-        )
+    renderer.print_list(
+        "Runs",
+        [
+            f"{run['id']}  {run['status']:<10}  {run['model']}  {run['started_at']}  {run['prompt'][:60]}"
+            for run in runs
+        ],
+    )
 
 
 def _show_trace(agent: Agent | None, run_id: str | None) -> None:
@@ -713,22 +664,26 @@ def _show_trace(agent: Agent | None, run_id: str | None) -> None:
         print(f"  turn={event['turn']} {event['kind']}: {detail[:500]}")
 
 
-def _show_tasks(agent: Agent | None, *, include_closed: bool = False) -> None:
+def _show_tasks(agent: Agent | None, *, include_closed: bool = False, renderer: CliRenderer | None = None) -> None:
+    renderer = renderer or CliRenderer(pretty=False)
     if agent is None:
-        print("Agent is unavailable.")
+        renderer.print_note("Agent is unavailable.", level="warning")
         return
     try:
         tasks = agent.list_tasks(include_closed=include_closed)
     except RuntimeError as exc:
-        print(str(exc))
+        renderer.print_note(str(exc), level="warning")
         return
     if not tasks:
-        print("No tasks for the active session.")
+        renderer.print_note("No tasks for the active session.", level="info")
         return
-    for task in tasks:
-        print(f"#{task['id']} [{task['status']}] {task['title']}")
-        if task.get("details"):
-            print(f"  {task['details']}")
+    renderer.print_list(
+        "Tasks",
+        [
+            f"#{task['id']} [{task['status']}] {task['title']}" + (f" | {task['details']}" if task.get("details") else "")
+            for task in tasks
+        ],
+    )
 
 
 def _handle_task_command(arguments: list[str], agent: Agent | None) -> None:

@@ -56,7 +56,9 @@ Key principles:
 - When you encounter errors, try to fix them rather than giving up.
 - Be thorough: check your work, verify results, handle edge cases.
 - If you're unsure, ask for clarification rather than guessing.
-- Respond in the user's language."""
+- Respond in the user's language.
+- Format Markdown cleanly: add a blank line after headings, before lists, and around fenced code blocks.
+- Never output vendor reasoning tags or hidden chain-of-thought."""
 
 
 def _environment_hints() -> str:

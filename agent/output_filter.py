@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -136,6 +137,112 @@ def sanitize_provider_items(items: list[dict[str, Any]], *, max_reasoning_chars:
                     max_reasoning_chars=max_reasoning_chars,
                 ).text
     return sanitized
+
+
+class MarkdownStreamFormatter:
+    def __init__(self, *, enabled: bool = True) -> None:
+        self.enabled = enabled
+        self._buffer = ""
+        self._lines: list[str] = []
+        self._in_code_fence = False
+        self._pending_blank_after_heading = False
+
+    def feed(self, chunk: str) -> str:
+        if not chunk:
+            return ""
+        normalized = chunk.replace("\r\n", "\n").replace("\r", "\n")
+        if not self.enabled:
+            return normalized
+        self._buffer += normalized
+        emitted: list[str] = []
+        while True:
+            index = self._buffer.find("\n")
+            if index < 0:
+                break
+            line = self._buffer[:index]
+            self._buffer = self._buffer[index + 1:]
+            emitted.append(self._push_line(line, terminated=True))
+        return "".join(emitted)
+
+    def finish(self) -> str:
+        if not self.enabled:
+            tail = self._buffer
+            self._buffer = ""
+            return tail
+        emitted = ""
+        if self._buffer:
+            emitted += self._push_line(self._buffer, terminated=False)
+            self._buffer = ""
+        return emitted
+
+    def _push_line(self, line: str, *, terminated: bool) -> str:
+        raw_line = line if self._in_code_fence else line.rstrip(" \t")
+        stripped = raw_line.strip()
+
+        if not stripped:
+            self._pending_blank_after_heading = False
+            return self._append_blank_line() if terminated else ""
+
+        is_fence = _is_fence_line(raw_line)
+        is_heading = _is_heading_line(raw_line) and not self._in_code_fence
+        is_list = _is_list_line(raw_line) and not self._in_code_fence
+        previous = self._last_line()
+        needs_blank_before = False
+
+        if previous is not None and previous != "" and not self._in_code_fence:
+            if is_heading or is_fence:
+                needs_blank_before = True
+            elif is_list and not _is_list_line(previous):
+                needs_blank_before = True
+            elif _is_fence_line(previous):
+                needs_blank_before = True
+
+        if self._pending_blank_after_heading and previous is not None and previous != "":
+            needs_blank_before = True
+        self._pending_blank_after_heading = False
+
+        prefix = self._append_blank_line() if needs_blank_before else ""
+        self._lines.append(raw_line)
+        if is_heading and terminated:
+            self._pending_blank_after_heading = True
+        if is_fence:
+            self._in_code_fence = not self._in_code_fence
+        return prefix + raw_line + ("\n" if terminated else "")
+
+    def _append_blank_line(self) -> str:
+        if self._last_line() == "":
+            return ""
+        self._lines.append("")
+        return "\n"
+
+    def _last_line(self) -> str | None:
+        if not self._lines:
+            return None
+        return self._lines[-1]
+
+
+def normalize_markdown_text(text: str) -> str:
+    formatter = MarkdownStreamFormatter(enabled=True)
+    normalized = formatter.feed(text)
+    normalized += formatter.finish()
+    return normalized.rstrip()
+
+
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+\S")
+_LIST_RE = re.compile(r"^\s{0,3}(?:[-*+]\s+\S|\d+\.\s+\S)")
+
+
+def _is_heading_line(line: str) -> bool:
+    return bool(_HEADING_RE.match(line))
+
+
+def _is_list_line(line: str) -> bool:
+    return bool(_LIST_RE.match(line))
+
+
+def _is_fence_line(line: str) -> bool:
+    stripped = line.lstrip()
+    return stripped.startswith("```") or stripped.startswith("~~~")
 
 
 def _partial_tag_suffix(value: str, tags: tuple[str, ...]) -> int:

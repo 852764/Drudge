@@ -4,8 +4,10 @@ import unittest
 
 from agent.output_filter import (
     DegenerateReasoningError,
+    MarkdownStreamFormatter,
     ReasoningTagFilter,
     filter_reasoning_text,
+    normalize_markdown_text,
     sanitize_provider_items,
 )
 
@@ -57,6 +59,29 @@ class OutputFilterTests(unittest.TestCase):
 
         self.assertEqual(cleaned[0]["encrypted_content"], "keep-me")
         self.assertEqual(cleaned[1]["content"][0]["text"], "visible")
+
+    def test_normalize_markdown_inserts_blank_lines_for_common_blocks(self):
+        result = normalize_markdown_text("## Title\n- one\n- two\n```py\nprint(1)\n```\nDone")
+
+        self.assertEqual(
+            result,
+            "## Title\n\n- one\n- two\n\n```py\nprint(1)\n```\n\nDone",
+        )
+
+    def test_stream_formatter_preserves_list_shape_across_chunks(self):
+        formatter = MarkdownStreamFormatter()
+
+        output = ""
+        output += formatter.feed("## Title\n- one")
+        output += formatter.feed("\n- two\n")
+        output += formatter.feed("```\ncode\n")
+        output += formatter.feed("```\nDone")
+        output += formatter.finish()
+
+        self.assertEqual(
+            output,
+            "## Title\n\n- one\n- two\n\n```\ncode\n```\n\nDone",
+        )
 
 
 if __name__ == "__main__":

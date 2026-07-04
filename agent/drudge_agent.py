@@ -10,8 +10,11 @@ from typing import Any, Awaitable, Callable
 from .llm import LLMClient, create_client
 from .output_filter import (
     DegenerateReasoningError,
+    FilteredText,
+    MarkdownStreamFormatter,
     ReasoningTagFilter,
     filter_reasoning_text,
+    normalize_markdown_text,
     sanitize_provider_items,
 )
 from .context_manager import (
@@ -83,6 +86,7 @@ class Agent:
         self._tool_selection_active = False
         self._recent_tool_names: list[str] = []
         self._current_run_id: str | None = None
+        self.tool_log_callback: Callable[[str, dict[str, Any] | None, str | None], Any] | None = None
         workspace = self.config.get("security", "workspace_root", default=".")
         self.skill_manager = SkillManager(
             workspace,
@@ -152,17 +156,49 @@ class Agent:
         if inspect.isawaitable(result):
             await result
 
+    def _hide_reasoning_enabled(self) -> bool:
+        return bool(self.config.get("display", "hide_reasoning_tags", default=True))
+
+    def _format_markdown_enabled(self) -> bool:
+        return bool(self.config.get("display", "format_markdown_output", default=True))
+
+    def _reasoning_max_chars(self) -> int:
+        return int(self.config.get("agent", "reasoning_tag_max_chars", default=12_000))
+
+    def _normalize_visible_text(self, text: str) -> str:
+        normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if self._format_markdown_enabled():
+            normalized = normalize_markdown_text(normalized)
+        return normalized
+
+    def _sanitize_visible_text(self, text: str | None) -> FilteredText:
+        raw = text or ""
+        if self._hide_reasoning_enabled():
+            filtered = filter_reasoning_text(
+                raw,
+                max_reasoning_chars=self._reasoning_max_chars(),
+            )
+        else:
+            filtered = FilteredText(
+                text=raw,
+                saw_tag=False,
+                unclosed_tag=False,
+                reasoning_chars=0,
+            )
+        return FilteredText(
+            text=self._normalize_visible_text(filtered.text),
+            saw_tag=filtered.saw_tag,
+            unclosed_tag=filtered.unclosed_tag,
+            reasoning_chars=filtered.reasoning_chars,
+        )
+
     async def _call_model_filtered(
         self,
         tool_schemas: list[dict],
         stream_callback: Any,
     ) -> tuple[dict, str | None, list[dict], bool, bool, int]:
-        hide_reasoning = bool(
-            self.config.get("display", "hide_reasoning_tags", default=True)
-        )
-        max_reasoning_chars = int(
-            self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
-        )
+        hide_reasoning = self._hide_reasoning_enabled()
+        max_reasoning_chars = self._reasoning_max_chars()
         recovery_attempts = max(
             0,
             int(self.config.get("agent", "reasoning_recovery_attempts", default=1)),
@@ -172,11 +208,13 @@ class Agent:
 
         for attempt in range(recovery_attempts + 1):
             parser = ReasoningTagFilter(max_reasoning_chars=max_reasoning_chars)
+            formatter = MarkdownStreamFormatter(enabled=self._format_markdown_enabled())
             turn_streamed = False
 
             async def emit_delta(delta: str) -> None:
                 nonlocal turn_streamed
                 visible = parser.feed(delta) if hide_reasoning else delta
+                visible = formatter.feed(visible)
                 if not visible:
                     return
                 turn_streamed = True
@@ -196,11 +234,16 @@ class Agent:
                     stream_callback=emit_delta if stream_callback else None,
                     cancel_event=self._cancel_event,
                 )
-                if stream_callback and hide_reasoning:
-                    tail = parser.finish()
+                if stream_callback:
+                    tail = parser.finish() if hide_reasoning else ""
+                    tail = formatter.feed(tail)
                     if tail:
                         turn_streamed = True
                         await self._emit(stream_callback, tail)
+                    trailing = formatter.finish()
+                    if trailing:
+                        turn_streamed = True
+                        await self._emit(stream_callback, trailing)
             except DegenerateReasoningError as exc:
                 self._record_model_call(
                     model=self.llm.model,
@@ -245,15 +288,8 @@ class Agent:
                 status="completed",
             )
             raw_text = self.llm.extract_text(response)
-            filtered = (
-                filter_reasoning_text(
-                    raw_text or "",
-                    max_reasoning_chars=max_reasoning_chars,
-                )
-                if hide_reasoning and raw_text
-                else None
-            )
-            text = filtered.text if filtered is not None else raw_text
+            filtered = self._sanitize_visible_text(raw_text)
+            text = filtered.text if raw_text is not None else None
             tool_calls = self.llm.extract_tool_calls(response)
             if hide_reasoning and response.get("provider_items"):
                 response["provider_items"] = sanitize_provider_items(
@@ -791,23 +827,15 @@ class Agent:
         return result
 
     def _sanitize_historical_reasoning(self) -> None:
-        if not self.config.get("display", "hide_reasoning_tags", default=True):
-            return
-        max_chars = int(
-            self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
-        )
         for message in self._messages:
             if message.get("role") != "assistant":
                 continue
             if isinstance(message.get("content"), str):
-                message["content"] = filter_reasoning_text(
-                    message["content"],
-                    max_reasoning_chars=max_chars,
-                ).text
-            if message.get("provider_items"):
+                message["content"] = self._sanitize_visible_text(message["content"]).text
+            if self._hide_reasoning_enabled() and message.get("provider_items"):
                 message["provider_items"] = sanitize_provider_items(
                     message["provider_items"],
-                    max_reasoning_chars=max_chars,
+                    max_reasoning_chars=self._reasoning_max_chars(),
                 )
 
     @staticmethod
@@ -1036,7 +1064,9 @@ class Agent:
             started_at=review_started,
             status="completed",
         )
-        review_text = self.refusal_llm.extract_text(review_response) or response_text
+        review_text = self._sanitize_visible_text(
+            self.refusal_llm.extract_text(review_response) or response_text
+        ).text or self._normalize_visible_text(response_text)
         self._messages.append({"role": "assistant", "content": review_text})
         self._persist_message("assistant", review_text, metadata={"refusal_review": True})
         reviewed = f"{notice}\n\n{review_text}"
@@ -1435,6 +1465,9 @@ class Agent:
 
     def _log_tool_call(self, name: str, args: dict, result: str) -> None:
         """记录工具调用（彩色输出）"""
+        if self.tool_log_callback is not None:
+            self.tool_log_callback(name, args, result)
+            return
         try:
             from colorama import Fore, Style, init
             init()

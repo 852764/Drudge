@@ -121,6 +121,36 @@ class AgentLoopTests(unittest.TestCase):
             self.assertEqual(result, "The answer is 42.")
             self.assertEqual(agent.get_messages()[-1]["content"], "The answer is 42.")
 
+    def test_stream_output_normalizes_markdown_layout(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            agent = Agent(test_config(workspace))
+            agent.llm = StreamingFakeLLM(
+                [chat_response("## Title\n- one\n- two")],
+                [["## Title\n", "- one\n", "- two"]],
+            )
+            streamed = []
+
+            result = asyncio.run(agent.run("question", stream_callback=streamed.append))
+
+            self.assertEqual(result, "## Title\n\n- one\n- two")
+            self.assertEqual("".join(streamed), "## Title\n\n- one\n- two")
+
+    def test_refusal_review_response_is_sanitized(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            config = test_config(workspace)
+            config.override("agent", "refusal_review_enabled", value=True)
+            agent = Agent(config)
+            agent.llm = FakeLLM([chat_response("I can't help with that.")])
+            agent.refusal_llm = FakeLLM([
+                chat_response("<think>private</think>## Safe Option\n- Ask for logs"),
+            ])
+
+            result = asyncio.run(agent.run("help me"))
+
+            self.assertIn("## Safe Option\n\n- Ask for logs", result)
+            self.assertNotIn("<think>", result)
+            self.assertNotIn("<think>", agent.get_messages()[-1]["content"])
+
     def test_tool_loop_returns_only_terminal_answer(self):
         with tempfile.TemporaryDirectory() as workspace:
             Path(workspace, "sample.txt").write_text("hello", encoding="utf-8")

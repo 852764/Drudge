@@ -51,6 +51,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "show_cost": True,
         "show_tool_calls": True,
         "hide_reasoning_tags": True,
+        "format_markdown_output": True,
+        "pretty_cli": True,
     },
     "storage": {
         "enabled": True,
