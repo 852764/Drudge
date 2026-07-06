@@ -119,6 +119,35 @@ class ConversationStore:
                     FOREIGN KEY(session_id) REFERENCES sessions(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scope TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS file_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    run_id TEXT,
+                    path TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    before_content TEXT,
+                    after_content TEXT,
+                    diff_summary TEXT NOT NULL DEFAULT '',
+                    undone INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    undone_at TEXT,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id),
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_messages_session_id
                 ON messages(session_id, id);
 
@@ -133,6 +162,12 @@ class ConversationStore:
 
                 CREATE INDEX IF NOT EXISTS idx_tasks_session_id
                 ON tasks(session_id, status, id);
+
+                CREATE INDEX IF NOT EXISTS idx_memories_scope_namespace
+                ON memories(scope, namespace, pinned, updated_at);
+
+                CREATE INDEX IF NOT EXISTS idx_file_revisions_session_id
+                ON file_revisions(session_id, undone, id);
                 """
             )
             columns = {
@@ -537,3 +572,242 @@ class ConversationStore:
             if cursor.rowcount == 0:
                 raise KeyError(f"Task not found: {task_id}")
         return self.get_task(session_id, task_id)
+
+    def create_memory(
+        self,
+        scope: str,
+        namespace: str,
+        content: str,
+        *,
+        title: str = "",
+        tags: list[str] | None = None,
+        pinned: bool = False,
+    ) -> dict[str, Any]:
+        clean_scope = str(scope).strip().lower()
+        if clean_scope not in {"project", "user"}:
+            raise ValueError(f"Invalid memory scope: {scope}")
+        clean_content = str(content).strip()
+        if not clean_content:
+            raise ValueError("Memory content cannot be empty")
+        clean_tags = [str(tag).strip()[:64] for tag in (tags or []) if str(tag).strip()][:20]
+        clean_title = " ".join(str(title).split()).strip()[:240]
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO memories (scope, namespace, title, content, tags_json, pinned)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_scope,
+                    str(namespace),
+                    clean_title,
+                    clean_content[:16000],
+                    json.dumps(clean_tags, ensure_ascii=False),
+                    1 if pinned else 0,
+                ),
+            )
+            memory_id = int(cursor.lastrowid)
+        return self.get_memory(memory_id)
+
+    def get_memory(self, memory_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, scope, namespace, title, content, tags_json, pinned,
+                       created_at, updated_at, last_used_at
+                FROM memories WHERE id = ?
+                """,
+                (int(memory_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Memory not found: {memory_id}")
+        item = dict(row)
+        item["tags"] = json.loads(item.pop("tags_json") or "[]")
+        item["pinned"] = bool(item.get("pinned"))
+        return item
+
+    def list_memories(
+        self,
+        *,
+        scope: str | None = None,
+        namespace: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scope:
+            clauses.append("scope = ?")
+            params.append(str(scope).strip().lower())
+        if namespace:
+            clauses.append("namespace = ?")
+            params.append(str(namespace))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, scope, namespace, title, content, tags_json, pinned,
+                       created_at, updated_at, last_used_at
+                FROM memories
+                {where}
+                ORDER BY pinned DESC,
+                         COALESCE(last_used_at, updated_at) DESC,
+                         id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["tags"] = json.loads(item.pop("tags_json") or "[]")
+            item["pinned"] = bool(item.get("pinned"))
+            result.append(item)
+        return result
+
+    def update_memory(
+        self,
+        memory_id: int,
+        *,
+        title: str | None = None,
+        content: str | None = None,
+        pinned: bool | None = None,
+    ) -> dict[str, Any]:
+        updates: list[str] = []
+        params: list[Any] = []
+        if title is not None:
+            updates.append("title = ?")
+            params.append(" ".join(str(title).split()).strip()[:240])
+        if content is not None:
+            clean_content = str(content).strip()
+            if not clean_content:
+                raise ValueError("Memory content cannot be empty")
+            updates.append("content = ?")
+            params.append(clean_content[:16000])
+        if pinned is not None:
+            updates.append("pinned = ?")
+            params.append(1 if pinned else 0)
+        if not updates:
+            return self.get_memory(memory_id)
+        params.extend([int(memory_id)])
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE memories
+                SET {', '.join(updates)}, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                tuple(params),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"Memory not found: {memory_id}")
+        return self.get_memory(memory_id)
+
+    def delete_memory(self, memory_id: int) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM memories WHERE id = ?",
+                (int(memory_id),),
+            )
+        return cursor.rowcount > 0
+
+    def touch_memory(self, memory_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE memories
+                SET last_used_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (int(memory_id),),
+            )
+
+    def record_file_revision(
+        self,
+        *,
+        session_id: str | None,
+        run_id: str | None,
+        path: str,
+        operation: str,
+        before_content: str | None,
+        after_content: str | None,
+        diff_summary: str = "",
+    ) -> dict[str, Any]:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO file_revisions
+                    (session_id, run_id, path, operation, before_content, after_content, diff_summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    run_id,
+                    str(path),
+                    str(operation),
+                    before_content,
+                    after_content,
+                    str(diff_summary)[:4000],
+                ),
+            )
+            revision_id = int(cursor.lastrowid)
+        return self.get_file_revision(revision_id)
+
+    def get_file_revision(self, revision_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, session_id, run_id, path, operation, before_content, after_content,
+                       diff_summary, undone, created_at, undone_at
+                FROM file_revisions WHERE id = ?
+                """,
+                (int(revision_id),),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"File revision not found: {revision_id}")
+        item = dict(row)
+        item["undone"] = bool(item.get("undone"))
+        return item
+
+    def list_file_revisions(
+        self,
+        session_id: str,
+        *,
+        include_undone: bool = False,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        condition = "" if include_undone else "AND undone = 0"
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, session_id, run_id, path, operation, before_content, after_content,
+                       diff_summary, undone, created_at, undone_at
+                FROM file_revisions
+                WHERE session_id = ? {condition}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (session_id, max(1, int(limit))),
+            ).fetchall()
+        result = [dict(row) for row in rows]
+        for item in result:
+            item["undone"] = bool(item.get("undone"))
+        return result
+
+    def get_latest_file_revision(self, session_id: str) -> dict[str, Any] | None:
+        items = self.list_file_revisions(session_id, include_undone=False, limit=1)
+        return items[0] if items else None
+
+    def mark_file_revision_undone(self, revision_id: int) -> dict[str, Any]:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE file_revisions
+                SET undone = 1, undone_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND undone = 0
+                """,
+                (int(revision_id),),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"File revision not found or already undone: {revision_id}")
+        return self.get_file_revision(revision_id)

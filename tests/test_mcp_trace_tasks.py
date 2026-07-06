@@ -51,6 +51,7 @@ class MCPTraceTaskTests(unittest.TestCase):
 
             async def exercise():
                 await provider.start()
+                tool_names = provider.tool_names()
                 self.assertIn("mcp__demo__echo", provider.tool_names())
                 result = await provider.call(
                     "mcp__demo__echo",
@@ -60,15 +61,52 @@ class MCPTraceTaskTests(unittest.TestCase):
                 )
                 status = provider.status()
                 await provider.close()
-                return result, status
+                return result, status, tool_names
 
-            result, status = asyncio.run(exercise())
+            result, status, tool_names = asyncio.run(exercise())
 
             payload = json.loads(result)
             self.assertTrue(payload["ok"])
             self.assertIn("echo:hello", payload["content"])
+            self.assertIn("mcp__demo__list_resources", tool_names)
+            self.assertIn("mcp__demo__get_prompt", tool_names)
             self.assertEqual(status["errors"], {})
             self.assertTrue(status["providers"][0]["connected"])
+
+    def test_mcp_resources_prompts_and_auto_restart(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            provider = create_tool_provider(
+                registry,
+                [],
+                mcp_config(workspace).get("mcp_servers"),
+                workspace,
+            )
+            context = ToolContext.from_config(
+                {"workspace_root": workspace, "approval_mode": "auto"},
+                [],
+            )
+
+            async def exercise():
+                await provider.start()
+                try:
+                    resources = json.loads(await provider.call("mcp__demo__list_resources", {}, context, approved=True))
+                    resource = json.loads(await provider.call("mcp__demo__read_resource", {"uri": "memory://readme"}, context, approved=True))
+                    prompt = json.loads(await provider.call("mcp__demo__get_prompt", {"name": "summarize"}, context, approved=True))
+                    process = provider.providers[1].process
+                    process.kill()
+                    await process.wait()
+                    restarted = json.loads(await provider.call("mcp__demo__echo", {"text": "again"}, context, approved=True))
+                    return resources, resource, prompt, restarted
+                finally:
+                    await provider.close()
+
+            resources, resource, prompt, restarted = asyncio.run(exercise())
+
+            self.assertTrue(resources["ok"])
+            self.assertIn("memory://readme", resources["content"])
+            self.assertIn("resource-body", resource["content"])
+            self.assertIn("prompt:summarize", prompt["content"])
+            self.assertIn("echo:again", restarted["content"])
 
     def test_mcp_medium_risk_requires_on_request_approval(self):
         with tempfile.TemporaryDirectory() as workspace:

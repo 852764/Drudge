@@ -52,9 +52,33 @@ def _attach_renderer(agent: Agent, renderer: CliRenderer) -> None:
     agent.tool_log_callback = renderer.print_tool_event
 
 
+def _render_run_status(agent: Agent) -> str:
+    activity = agent.get_activity_label()
+    if activity:
+        return activity
+    state = agent.get_run_state()
+    status = getattr(state.status, "value", str(state.status))
+    detail = state.events[-1].detail if state.events else {}
+    if status == "executing_tools":
+        tool = detail.get("tool")
+        return f"Running tool: {tool}" if tool else "Running tools"
+    if status == "waiting_for_approval":
+        tool = detail.get("tool")
+        return f"Waiting approval: {tool}" if tool else "Waiting approval"
+    if status == "waiting_for_model":
+        return "Thinking"
+    if status == "completed":
+        return "Completed"
+    if status == "failed":
+        return "Failed"
+    if status == "cancelled":
+        return "Cancelled"
+    return "Thinking"
+
+
 async def _run_and_print(agent: Agent, query: str, renderer: CliRenderer) -> str:
     printer = renderer.make_stream_printer("Assistant")
-    ticker = renderer.make_activity_ticker("Thinking")
+    ticker = renderer.make_activity_ticker("Thinking", state_getter=lambda: _render_run_status(agent))
     task = asyncio.create_task(ticker.run())
     response = ""
     try:
@@ -68,7 +92,7 @@ async def _run_and_print(agent: Agent, query: str, renderer: CliRenderer) -> str
 
 async def _run_runtime_and_print(runtime: AgentRuntime, query: str, renderer: CliRenderer) -> str:
     printer = renderer.make_stream_printer("Assistant")
-    ticker = renderer.make_activity_ticker("Thinking")
+    ticker = renderer.make_activity_ticker("Thinking", state_getter=lambda: _render_run_status(runtime.agent))
     task = asyncio.create_task(ticker.run())
     response = ""
     try:
@@ -571,7 +595,13 @@ async def _handle_command(cmd: str, config, agent: Agent | None = None, *, rende
     elif command == "/skills":
         _show_skills(agent, renderer=renderer)
     elif command == "/skill":
-        _handle_skill_command(parts[1:], agent)
+        await _handle_skill_command(parts[1:], agent, renderer=renderer)
+    elif command == "/memory":
+        await _handle_memory_command(parts[1:], agent, renderer=renderer)
+    elif command == "/changes":
+        _show_file_revisions(agent, renderer=renderer)
+    elif command == "/undo":
+        _handle_undo_command(agent, renderer=renderer)
     elif command == "/clear":
         import os
         os.system("cls" if os.name == "nt" else "clear")
@@ -605,6 +635,14 @@ def _show_mcp(status: dict, *, renderer: CliRenderer | None = None) -> None:
     for item in providers:
         state = "connected" if item.get("connected") else "unavailable"
         items.append(f"{item['name']}: {state}")
+        capabilities = item.get("capabilities") or {}
+        if capabilities:
+            enabled = [name for name, active in capabilities.items() if active]
+            items.append(f"capabilities: {', '.join(enabled) or '(none)'}")
+        if item.get("resource_count"):
+            items.append(f"resources: {item['resource_count']}")
+        if item.get("prompt_count"):
+            items.append(f"prompts: {item['prompt_count']}")
         if item.get("error"):
             items.append(f"error: {item['error']}")
         for tool in item.get("tools") or []:
@@ -715,38 +753,141 @@ def _handle_task_command(arguments: list[str], agent: Agent | None) -> None:
         print(str(exc))
 
 
-def _handle_skill_command(arguments: list[str], agent: Agent | None) -> None:
+async def _handle_skill_command(
+    arguments: list[str],
+    agent: Agent | None,
+    *,
+    renderer: CliRenderer | None = None,
+) -> None:
+    renderer = renderer or CliRenderer(pretty=False)
     if agent is None:
-        print("Agent is unavailable.")
+        renderer.print_note("Agent is unavailable.", level="warning")
         return
     if not arguments:
-        print("Usage: /skill <name> | off <name> | show <name> | clear")
+        renderer.print_note("Usage: /skill <name> | off <name> | show <name> | run <name> [phase] | clear", level="warning")
         return
     action = arguments[0].lower()
     try:
         if action == "clear":
             agent.clear_skills()
-            print("All skills deactivated.")
+            renderer.print_note("All skills deactivated.", level="success")
         elif action == "off":
             if len(arguments) < 2:
-                print("Usage: /skill off <name>")
+                renderer.print_note("Usage: /skill off <name>", level="warning")
             elif agent.deactivate_skill(arguments[1]):
-                print(f"Deactivated skill: {arguments[1]}")
+                renderer.print_note(f"Deactivated skill: {arguments[1]}", level="success")
             else:
-                print(f"Skill is not active: {arguments[1]}")
+                renderer.print_note(f"Skill is not active: {arguments[1]}", level="warning")
         elif action == "show":
             if len(arguments) < 2:
-                print("Usage: /skill show <name>")
+                renderer.print_note("Usage: /skill show <name>", level="warning")
             else:
                 skill = agent.get_skill(arguments[1])
-                print(f"Name: {skill.name}")
-                print(f"Description: {skill.description}")
-                print(f"Path: {skill.path}")
+                lines = [
+                    f"Description: {skill.description}",
+                    f"Path: {skill.path}",
+                    f"Workflow phases: {', '.join(skill.scripts) or '(none)'}",
+                    f"References: {', '.join(name for name, _ in skill.references) or '(none)'}",
+                ]
+                renderer.print_panel(f"Skill {skill.name}", lines)
+        elif action == "run":
+            if len(arguments) < 2:
+                renderer.print_note("Usage: /skill run <name> [phase]", level="warning")
+            else:
+                phase = arguments[2] if len(arguments) > 2 else "run"
+                results = await agent.run_skill_phase(arguments[1], phase)
+                renderer.print_panel(
+                    f"Skill {arguments[1]}:{phase}",
+                    [f"{item['command']} => {'ok' if item.get('ok') else 'error'}" for item in results],
+                )
         else:
             skill = agent.activate_skill(arguments[0])
-            print(f"Activated skill: {skill.name} ({skill.description})")
-    except KeyError as exc:
-        print(str(exc))
+            renderer.print_note(f"Activated skill: {skill.name} ({skill.description})", level="success")
+    except (KeyError, RuntimeError, ValueError) as exc:
+        renderer.print_note(str(exc), level="warning")
+
+
+async def _handle_memory_command(
+    arguments: list[str],
+    agent: Agent | None,
+    *,
+    renderer: CliRenderer | None = None,
+) -> None:
+    renderer = renderer or CliRenderer(pretty=False)
+    if agent is None:
+        renderer.print_note("Agent is unavailable.", level="warning")
+        return
+    if not arguments or arguments[0].lower() == "list":
+        scope = arguments[1].lower() if len(arguments) > 1 else None
+        memories = agent.list_memories(scope=scope)
+        if not memories:
+            renderer.print_note("No persistent memories found.", level="info")
+            return
+        renderer.print_list(
+            "Memories",
+            [
+                f"#{item['id']} [{'PIN' if item['pinned'] else item['scope']}] {item['title'] or item['content'][:60]}"
+                for item in memories
+            ],
+        )
+        return
+    action = arguments[0].lower()
+    try:
+        if action == "add":
+            if len(arguments) < 3:
+                renderer.print_note("Usage: /memory add <project|user> <content>", level="warning")
+                return
+            scope = arguments[1].lower()
+            content = " ".join(arguments[2:]).strip()
+            memory = agent.create_memory(content, scope=scope)
+            renderer.print_note(f"Saved memory #{memory['id']} ({memory['scope']}).", level="success")
+        elif action in {"pin", "unpin"}:
+            if len(arguments) != 2:
+                renderer.print_note(f"Usage: /memory {action} <id>", level="warning")
+                return
+            memory = agent.update_memory(int(arguments[1]), pinned=action == "pin")
+            renderer.print_note(f"Memory #{memory['id']} pinned={memory['pinned']}", level="success")
+        elif action == "rm":
+            if len(arguments) != 2:
+                renderer.print_note("Usage: /memory rm <id>", level="warning")
+                return
+            deleted = agent.delete_memory(int(arguments[1]))
+            renderer.print_note("Memory deleted." if deleted else "Memory not found.", level="success" if deleted else "warning")
+        else:
+            renderer.print_note("Usage: /memory list [scope] | add <project|user> <content> | pin <id> | unpin <id> | rm <id>", level="warning")
+    except (KeyError, RuntimeError, ValueError) as exc:
+        renderer.print_note(str(exc), level="warning")
+
+
+def _show_file_revisions(agent: Agent | None, *, renderer: CliRenderer | None = None) -> None:
+    renderer = renderer or CliRenderer(pretty=False)
+    if agent is None:
+        renderer.print_note("Agent is unavailable.", level="warning")
+        return
+    try:
+        revisions = agent.list_file_revisions()
+    except RuntimeError as exc:
+        renderer.print_note(str(exc), level="warning")
+        return
+    if not revisions:
+        renderer.print_note("No reversible file changes for the active session.", level="info")
+        return
+    renderer.print_list(
+        "File Changes",
+        [f"#{item['id']} {item['operation']} {item['path']}" for item in revisions],
+    )
+
+
+def _handle_undo_command(agent: Agent | None, *, renderer: CliRenderer | None = None) -> None:
+    renderer = renderer or CliRenderer(pretty=False)
+    if agent is None:
+        renderer.print_note("Agent is unavailable.", level="warning")
+        return
+    try:
+        revision = agent.undo_last_file_change()
+        renderer.print_note(f"Reverted change #{revision['id']} -> {revision['path']}", level="success")
+    except RuntimeError as exc:
+        renderer.print_note(str(exc), level="warning")
 
 
 def _get_store(config):

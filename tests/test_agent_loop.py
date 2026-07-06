@@ -41,6 +41,30 @@ class StreamingFakeLLM(FakeLLM):
         return response
 
 
+class InspectingFakeLLM(FakeLLM):
+    def __init__(self, responses, observer):
+        super().__init__(responses)
+        self.observer = observer
+        self.observed: list[str | None] = []
+
+    async def chat(
+        self,
+        messages,
+        tools=None,
+        tool_choice=None,
+        stream_callback=None,
+        cancel_event=None,
+    ):
+        self.observed.append(self.observer())
+        return await super().chat(
+            messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            stream_callback=stream_callback,
+            cancel_event=cancel_event,
+        )
+
+
 def test_config(workspace: str, *, max_turns: int = 5) -> ConfigManager:
     config = ConfigManager()
     config.override("storage", "enabled", value=False)
@@ -275,6 +299,26 @@ class AgentLoopTests(unittest.TestCase):
             self.assertIn("message 0", fake.requests[0]["messages"][1]["content"])
             self.assertIsNone(fake.requests[0]["tools"])
             self.assertEqual(agent.get_token_usage()["total_tokens"], 10)
+
+    def test_manual_compaction_sets_activity_label_during_summary(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            config = test_config(workspace)
+            config.override("agent", "compact_keep_recent", value=3)
+            agent = Agent(config)
+            fake = InspectingFakeLLM(
+                [chat_response("## Summary\n- Keep recent messages")],
+                agent.get_activity_label,
+            )
+            agent.llm = fake
+            agent._messages = [{"role": "system", "content": "sys"}] + [
+                {"role": "user", "content": f"message {index}"}
+                for index in range(10)
+            ]
+
+            asyncio.run(agent.compact_context())
+
+            self.assertEqual(fake.observed, ["Summarizing context"])
+            self.assertIsNone(agent.get_activity_label())
 
     def test_manual_compaction_falls_back_when_summary_model_fails(self):
         with tempfile.TemporaryDirectory() as workspace:

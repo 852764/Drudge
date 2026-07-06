@@ -3,6 +3,8 @@
 import asyncio
 import inspect
 import json
+import re
+from contextlib import contextmanager
 from pathlib import Path
 from time import monotonic
 from typing import Any, Awaitable, Callable
@@ -37,6 +39,7 @@ from .tool_selector import (
 from tools import (
     ApprovalDecision,
     ApprovalRequest,
+    MemoryToolProvider,
     RiskLevel,
     TaskToolProvider,
     ToolSearchProvider,
@@ -86,6 +89,7 @@ class Agent:
         self._tool_selection_active = False
         self._recent_tool_names: list[str] = []
         self._current_run_id: str | None = None
+        self._activity_label: str | None = None
         self.tool_log_callback: Callable[[str, dict[str, Any] | None, str | None], Any] | None = None
         workspace = self.config.get("security", "workspace_root", default=".")
         self.skill_manager = SkillManager(
@@ -95,11 +99,18 @@ class Agent:
         self.active_skill_names: list[str] = []
         self._init_store()
         task_provider = None
+        memory_provider = None
         if self.store is not None:
             task_provider = TaskToolProvider(
                 self.list_tasks,
                 self.create_task,
                 self.update_task,
+            )
+            memory_provider = MemoryToolProvider(
+                self.list_memories,
+                self.create_memory,
+                self.update_memory,
+                self.delete_memory,
             )
         selection_enabled = bool(
             self.config.get("tool_selection", "enabled", default=True)
@@ -120,6 +131,7 @@ class Agent:
             self.config.get("mcp_servers", default={}) or {},
             workspace,
             task_provider=task_provider,
+            memory_provider=memory_provider,
             search_provider=search_provider,
         )
 
@@ -155,6 +167,15 @@ class Agent:
         result = callback(text)
         if inspect.isawaitable(result):
             await result
+
+    @contextmanager
+    def _activity(self, label: str):
+        previous = self._activity_label
+        self._activity_label = label
+        try:
+            yield
+        finally:
+            self._activity_label = previous
 
     def _hide_reasoning_enabled(self) -> bool:
         return bool(self.config.get("display", "hide_reasoning_tags", default=True))
@@ -425,6 +446,7 @@ class Agent:
                 self.config.get("model", "name", default="unknown"),
                 metadata={"utility_model": self.config.get_utility_model_config().get("name")},
             )
+            self._refresh_tool_context()
 
     def _finish_trace(self) -> None:
         if self.store and self._current_run_id:
@@ -438,6 +460,127 @@ class Agent:
                     "utility_tokens": self._utility_tokens,
                 },
             )
+            self._current_run_id = None
+            self._refresh_tool_context()
+
+    def _memory_namespace(self) -> str:
+        return str(self.config.get("security", "workspace_root", default="."))
+
+    def list_memories(self, scope: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        if scope == "user":
+            return self.store.list_memories(scope="user", namespace="__user__", limit=limit)
+        if scope == "project":
+            return self.store.list_memories(scope="project", namespace=self._memory_namespace(), limit=limit)
+        memories = self.store.list_memories(scope="user", namespace="__user__", limit=limit)
+        memories.extend(self.store.list_memories(scope="project", namespace=self._memory_namespace(), limit=limit))
+        ranked = self._rank_memories("", memories)
+        return ranked[:limit]
+
+    def create_memory(
+        self,
+        content: str,
+        *,
+        scope: str = "project",
+        title: str = "",
+        pinned: bool = False,
+    ) -> dict[str, Any]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        namespace = "__user__" if scope == "user" else self._memory_namespace()
+        memory = self.store.create_memory(
+            scope,
+            namespace,
+            content,
+            title=title,
+            pinned=pinned,
+        )
+        self._trace_event("memory_created", {"memory": memory})
+        return memory
+
+    def update_memory(self, memory_id: int, *, pinned: bool | None = None, content: str | None = None) -> dict[str, Any]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        memory = self.store.update_memory(memory_id, pinned=pinned, content=content)
+        self._trace_event("memory_updated", {"memory": memory})
+        return memory
+
+    def delete_memory(self, memory_id: int) -> bool:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        deleted = self.store.delete_memory(memory_id)
+        if deleted:
+            self._trace_event("memory_deleted", {"memory_id": memory_id})
+        return deleted
+
+    def _select_memory_entries(self, prompt: str, explicit_entries: list[str] | None = None) -> list[str]:
+        entries = list(explicit_entries or [])
+        if not self.store:
+            return entries
+        candidates = self.store.list_memories(scope="user", namespace="__user__", limit=100)
+        candidates.extend(self.store.list_memories(scope="project", namespace=self._memory_namespace(), limit=100))
+        ranked = self._rank_memories(prompt, candidates)
+        for memory in ranked[: int(self.config.get("agent", "memory_max_entries", default=8))]:
+            self.store.touch_memory(memory["id"])
+            label = f"[{memory['scope']} memory #{memory['id']}]"
+            title = f" {memory['title']}" if memory.get("title") else ""
+            entries.append(f"{label}{title}: {memory['content']}")
+        return entries
+
+    def _rank_memories(self, prompt: str, memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        tokens = {token for token in re.findall(r"[\w\-\u4e00-\u9fff]+", (prompt or "").lower()) if len(token) > 1}
+
+        def score(memory: dict[str, Any]) -> tuple[int, int, int]:
+            haystack = f"{memory.get('title', '')}\n{memory.get('content', '')}".lower()
+            overlap = sum(1 for token in tokens if token in haystack)
+            pinned_score = 100 if memory.get("pinned") else 0
+            scope_score = 1 if memory.get("scope") == "project" else 0
+            return (pinned_score + overlap * 10 + scope_score, overlap, int(memory["id"]))
+
+        unique: dict[int, dict[str, Any]] = {int(item["id"]): item for item in memories}
+        return sorted(unique.values(), key=score, reverse=True)
+
+    def _record_file_change(self, payload: dict[str, Any]) -> None:
+        if not self.store:
+            return
+        revision = self.store.record_file_revision(
+            session_id=self.session_id,
+            run_id=self._current_run_id,
+            path=str(payload.get("path") or ""),
+            operation=str(payload.get("operation") or "write"),
+            before_content=payload.get("before_content"),
+            after_content=payload.get("after_content"),
+            diff_summary=str(payload.get("diff_summary") or ""),
+        )
+        self._trace_event("file_revision", {"revision": revision})
+
+    def list_file_revisions(self, limit: int = 20) -> list[dict[str, Any]]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        if not self.session_id:
+            raise RuntimeError("No active session")
+        return self.store.list_file_revisions(self.session_id, limit=limit)
+
+    def undo_last_file_change(self) -> dict[str, Any]:
+        if not self.store:
+            raise RuntimeError("Conversation storage is disabled")
+        if not self.session_id:
+            raise RuntimeError("No active session")
+        revision = self.store.get_latest_file_revision(self.session_id)
+        if revision is None:
+            raise RuntimeError("No reversible file changes for the active session")
+        path = self.tool_context.resolve_path(revision["path"]) if self.tool_context else Path(revision["path"])
+        before_content = revision.get("before_content")
+        if before_content is None:
+            if path.exists():
+                path.unlink()
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(before_content, encoding="utf-8")
+        updated = self.store.mark_file_revision_undone(revision["id"])
+        self._trace_event("file_revision_undone", {"revision": updated})
+        return updated
 
     def list_tasks(self, include_closed: bool = False) -> list[dict[str, Any]]:
         if not self.store:
@@ -538,122 +681,123 @@ class Agent:
             self._trace_event("tool_selection", result, turn=0)
             return result
 
-        self._tool_selection_active = True
-        sticky_limit = max(0, int(config.get("sticky_recent", 4)))
-        sticky = [
-            name
-            for name in self._recent_tool_names[-sticky_limit:]
-            if name in available
-        ] if sticky_limit else []
-        always = [
-            str(name)
-            for name in config.get("always_include", [])
-            if str(name) in available
-        ]
-        selector_tokens = 0
-        selector_model: str | None = None
-        selector_started = monotonic()
-        error: str | None = None
-        try:
-            selector_llm = self._get_utility_llm()
-            selector_model = selector_llm.model
-            discovered_skills = self.skill_manager.discover()
-            active_skill_context = [
-                {
-                    "name": name,
-                    "description": discovered_skills[name].description,
-                }
-                for name in self.active_skill_names
-                if name in discovered_skills
+        with self._activity("Selecting tools"):
+            self._tool_selection_active = True
+            sticky_limit = max(0, int(config.get("sticky_recent", 4)))
+            sticky = [
+                name
+                for name in self._recent_tool_names[-sticky_limit:]
+                if name in available
+            ] if sticky_limit else []
+            always = [
+                str(name)
+                for name in config.get("always_include", [])
+                if str(name) in available
             ]
-            response = await selector_llm.chat(
-                build_tool_selection_messages(
-                    prompt,
+            selector_tokens = 0
+            selector_model: str | None = None
+            selector_started = monotonic()
+            error: str | None = None
+            try:
+                selector_llm = self._get_utility_llm()
+                selector_model = selector_llm.model
+                discovered_skills = self.skill_manager.discover()
+                active_skill_context = [
+                    {
+                        "name": name,
+                        "description": discovered_skills[name].description,
+                    }
+                    for name in self.active_skill_names
+                    if name in discovered_skills
+                ]
+                response = await selector_llm.chat(
+                    build_tool_selection_messages(
+                        prompt,
+                        catalog,
+                        active_skills=active_skill_context,
+                        recent_tools=sticky,
+                        conversation_context=self._tool_selection_conversation_context(),
+                        max_selected=max_selected,
+                    ),
+                    tools=None,
+                    cancel_event=self._cancel_event,
+                )
+                selector_tokens = int(
+                    (response.get("usage") or {}).get("total_tokens", 0) or 0
+                )
+                self._total_tokens += selector_tokens
+                self._utility_tokens += selector_tokens
+                raw = selector_llm.extract_text(response) or ""
+                filtered = filter_reasoning_text(
+                    raw,
+                    max_reasoning_chars=int(
+                        self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
+                    ),
+                )
+                selection = parse_tool_selection(
+                    filtered.text,
                     catalog,
-                    active_skills=active_skill_context,
-                    recent_tools=sticky,
-                    conversation_context=self._tool_selection_conversation_context(),
                     max_selected=max_selected,
-                ),
-                tools=None,
-                cancel_event=self._cancel_event,
-            )
-            selector_tokens = int(
-                (response.get("usage") or {}).get("total_tokens", 0) or 0
-            )
-            self._total_tokens += selector_tokens
-            self._utility_tokens += selector_tokens
-            raw = selector_llm.extract_text(response) or ""
-            filtered = filter_reasoning_text(
-                raw,
-                max_reasoning_chars=int(
-                    self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
-                ),
-            )
-            selection = parse_tool_selection(
-                filtered.text,
-                catalog,
-                max_selected=max_selected,
-            )
-            selected = selection.names
-            reason = selection.reason
-            mode = "llm"
-            self._record_model_call(
-                model=selector_llm.model,
-                purpose="tool_selection",
-                total_tokens=selector_tokens,
-                started_at=selector_started,
-                status="completed",
-            )
-        except asyncio.CancelledError:
-            if selector_model:
+                )
+                selected = selection.names
+                reason = selection.reason
+                mode = "llm"
                 self._record_model_call(
-                    model=selector_model,
+                    model=selector_llm.model,
                     purpose="tool_selection",
                     total_tokens=selector_tokens,
                     started_at=selector_started,
-                    status="cancelled",
+                    status="completed",
                 )
-            raise
-        except Exception as exc:
-            error = format_exception(exc)
-            if selector_model:
-                self._record_model_call(
-                    model=selector_model,
-                    purpose="tool_selection",
-                    total_tokens=selector_tokens,
-                    started_at=selector_started,
-                    status="failed",
-                    error=error,
-                )
-            selected = [
-                item["name"]
-                for item in rank_tool_catalog(prompt, catalog, limit=max_selected)
-            ]
-            reason = "deterministic catalog ranking"
-            mode = "fallback"
+            except asyncio.CancelledError:
+                if selector_model:
+                    self._record_model_call(
+                        model=selector_model,
+                        purpose="tool_selection",
+                        total_tokens=selector_tokens,
+                        started_at=selector_started,
+                        status="cancelled",
+                    )
+                raise
+            except Exception as exc:
+                error = format_exception(exc)
+                if selector_model:
+                    self._record_model_call(
+                        model=selector_model,
+                        purpose="tool_selection",
+                        total_tokens=selector_tokens,
+                        started_at=selector_started,
+                        status="failed",
+                        error=error,
+                    )
+                selected = [
+                    item["name"]
+                    for item in rank_tool_catalog(prompt, catalog, limit=max_selected)
+                ]
+                reason = "deterministic catalog ranking"
+                mode = "fallback"
 
-        ordered: list[str] = []
-        for name in [*always, *sticky, *selected]:
-            if name in available and name not in ordered:
-                ordered.append(name)
-            if len(ordered) >= max_selected:
-                break
-        self._turn_tool_names = set(ordered)
-        result = {
-            "mode": mode,
-            "catalog_tools": len(all_schemas),
-            "schema_tokens": schema_tokens,
-            "selected": ordered,
-            "selector_model": selector_model,
-            "selector_tokens": selector_tokens,
-            "reason": reason,
-        }
-        if error:
-            result["fallback_reason"] = error
-        self._last_tool_selection = result
-        self._trace_event("tool_selection", result, turn=0)
-        return result
+            ordered: list[str] = []
+            for name in [*always, *sticky, *selected]:
+                if name in available and name not in ordered:
+                    ordered.append(name)
+                if len(ordered) >= max_selected:
+                    break
+            self._turn_tool_names = set(ordered)
+            result = {
+                "mode": mode,
+                "catalog_tools": len(all_schemas),
+                "schema_tokens": schema_tokens,
+                "selected": ordered,
+                "selector_model": selector_model,
+                "selector_tokens": selector_tokens,
+                "reason": reason,
+            }
+            if error:
+                result["fallback_reason"] = error
+            self._last_tool_selection = result
+            self._trace_event("tool_selection", result, turn=0)
+            return result
 
     def _tool_selection_conversation_context(self) -> list[dict[str, str]]:
         context: list[dict[str, str]] = []
@@ -767,6 +911,30 @@ class Agent:
         self._persist_session_extensions()
         self._refresh_system_message()
 
+    async def run_skill_phase(self, name: str, phase: str = "run") -> list[dict[str, Any]]:
+        skill = self.skill_manager.get(name)
+        commands = self.skill_manager.run_commands(skill, phase)
+        if not commands:
+            raise RuntimeError(f"Skill '{name}' has no '{phase}' commands")
+        owned_lifecycle = not self._started
+        if owned_lifecycle:
+            await self.start()
+        try:
+            results: list[dict[str, Any]] = []
+            for command in commands:
+                payload = await self.tool_provider.call(
+                    "terminal",
+                    {"command": command, "workdir": str(skill.path.parent), "timeout": 180},
+                    context=self.tool_context,
+                    approved=False,
+                )
+                result = json.loads(payload)
+                results.append({"command": command, **result})
+            return results
+        finally:
+            if owned_lifecycle:
+                await self.close()
+
     def _persist_session_extensions(self) -> None:
         if self.store and self.session_id:
             self.store.update_session_metadata(
@@ -785,7 +953,9 @@ class Agent:
         self._turn_tool_names.clear()
         self._recent_tool_names.clear()
         self._session_approvals.clear()
+        self._activity_label = None
         self.run_state = AgentRunState()
+        self._refresh_tool_context()
         if clear_skills:
             self.active_skill_names.clear()
 
@@ -807,6 +977,7 @@ class Agent:
             if str(name) in available
         ]
         self.session_id = session_id
+        self._refresh_tool_context()
         self._messages = [self._restore_message(row) for row in rows]
         self._sanitize_historical_reasoning()
         assistant_turns = sum(1 for message in self._messages if message.get("role") == "assistant")
@@ -818,6 +989,7 @@ class Agent:
         self._turn_tool_names.clear()
         self._recent_tool_names.clear()
         self._session_approvals.clear()
+        self._activity_label = None
         repaired = self._repair_incomplete_tool_transactions()
         self._refresh_system_message()
         result = dict(session)
@@ -879,8 +1051,17 @@ class Agent:
         if self.llm is None:
             mc = self.config.get_model_config()
             self.llm = create_client(mc)
+        self._refresh_tool_context()
+
+    def _refresh_tool_context(self) -> None:
         security = self.config.get_security_config()
-        self.tool_context = ToolContext.from_config(security, self.config.get_toolsets())
+        self.tool_context = ToolContext.from_config(
+            security,
+            self.config.get_toolsets(),
+            session_id=self.session_id,
+            run_id=self._current_run_id,
+            record_file_change=self._record_file_change,
+        )
 
     def _init_refusal_llm(self) -> None:
         if self.refusal_llm is None:
@@ -997,6 +1178,7 @@ class Agent:
             cwd=str(Path.cwd()),
             metadata={"active_skills": list(self.active_skill_names)},
         )
+        self._refresh_tool_context()
         for message in self._messages:
             self._persist_message(message["role"], message.get("content"))
 
@@ -1037,42 +1219,43 @@ class Agent:
             "refusal_review_notice",
             "[Drudge] Detected a possible refusal. Running a safe second-pass review...",
         )
-        self._persist_message("system", notice, metadata={"event": "refusal_review_started"})
+        with self._activity("Safety review"):
+            self._persist_message("system", notice, metadata={"event": "refusal_review_started"})
 
-        self._init_refusal_llm()
-        review_messages = build_refusal_review_messages(user_prompt, response_text)
-        review_started = monotonic()
-        try:
-            review_response = await self.refusal_llm.chat(review_messages)
-        except Exception as exc:
+            self._init_refusal_llm()
+            review_messages = build_refusal_review_messages(user_prompt, response_text)
+            review_started = monotonic()
+            try:
+                review_response = await self.refusal_llm.chat(review_messages)
+            except Exception as exc:
+                self._record_model_call(
+                    model=self.refusal_llm.model,
+                    purpose="refusal_review",
+                    total_tokens=0,
+                    started_at=review_started,
+                    status="failed",
+                    error=format_exception(exc),
+                )
+                raise
+            usage = review_response.get("usage", {})
+            review_tokens = int(usage.get("total_tokens", 0) or 0)
+            self._total_tokens += review_tokens
             self._record_model_call(
                 model=self.refusal_llm.model,
                 purpose="refusal_review",
-                total_tokens=0,
+                total_tokens=review_tokens,
                 started_at=review_started,
-                status="failed",
-                error=format_exception(exc),
+                status="completed",
             )
-            raise
-        usage = review_response.get("usage", {})
-        review_tokens = int(usage.get("total_tokens", 0) or 0)
-        self._total_tokens += review_tokens
-        self._record_model_call(
-            model=self.refusal_llm.model,
-            purpose="refusal_review",
-            total_tokens=review_tokens,
-            started_at=review_started,
-            status="completed",
-        )
-        review_text = self._sanitize_visible_text(
-            self.refusal_llm.extract_text(review_response) or response_text
-        ).text or self._normalize_visible_text(response_text)
-        self._messages.append({"role": "assistant", "content": review_text})
-        self._persist_message("assistant", review_text, metadata={"refusal_review": True})
-        reviewed = f"{notice}\n\n{review_text}"
-        if stream_callback:
-            await self._emit(stream_callback, f"\n\n{reviewed}")
-        return reviewed
+            review_text = self._sanitize_visible_text(
+                self.refusal_llm.extract_text(review_response) or response_text
+            ).text or self._normalize_visible_text(response_text)
+            self._messages.append({"role": "assistant", "content": review_text})
+            self._persist_message("assistant", review_text, metadata={"refusal_review": True})
+            reviewed = f"{notice}\n\n{review_text}"
+            if stream_callback:
+                await self._emit(stream_callback, f"\n\n{reviewed}")
+            return reviewed
 
     async def run(
         self,
@@ -1106,6 +1289,7 @@ class Agent:
         finally:
             if owned_lifecycle:
                 await self.close()
+            self._activity_label = None
             self._finish_trace()
             self._current_run_id = None
             self._active_task = None
@@ -1131,6 +1315,8 @@ class Agent:
         """
         self._cancel_event = asyncio.Event()
         self._active_task = asyncio.current_task()
+        self._activity_label = None
+        memory_entries = self._select_memory_entries(prompt, memory_entries)
         self._refresh_system_message(memory_entries, skills)
         self._ensure_session(prompt, memory_entries, skills)
         self.run_state = AgentRunState()
@@ -1383,73 +1569,74 @@ class Agent:
         summary_model: str | None = None
         error: str | None = None
 
-        if configured_mode == "llm":
-            try:
-                summary_llm = self._get_utility_llm()
-                summary_model = summary_llm.model
-                summary_started = monotonic()
-                response = await summary_llm.chat(
-                    build_context_summary_messages(old_messages),
-                    tools=None,
-                    cancel_event=self._cancel_event,
-                )
-                usage = response.get("usage", {})
-                summary_tokens = int(usage.get("total_tokens", 0) or 0)
-                raw_summary = summary_llm.extract_text(response) or ""
-                filtered = filter_reasoning_text(
-                    raw_summary,
-                    max_reasoning_chars=int(
-                        self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
-                    ),
-                )
-                summary = filtered.text.strip()
-                if not summary:
-                    raise RuntimeError("context summary model returned no visible text")
-                self._record_model_call(
-                    model=summary_llm.model,
-                    purpose="context_summary",
-                    total_tokens=summary_tokens,
-                    started_at=summary_started,
-                    status="completed",
-                )
-                mode = "llm"
-            except Exception as exc:
-                if summary_model:
+        with self._activity("Summarizing context"):
+            if configured_mode == "llm":
+                try:
+                    summary_llm = self._get_utility_llm()
+                    summary_model = summary_llm.model
+                    summary_started = monotonic()
+                    response = await summary_llm.chat(
+                        build_context_summary_messages(old_messages),
+                        tools=None,
+                        cancel_event=self._cancel_event,
+                    )
+                    usage = response.get("usage", {})
+                    summary_tokens = int(usage.get("total_tokens", 0) or 0)
+                    raw_summary = summary_llm.extract_text(response) or ""
+                    filtered = filter_reasoning_text(
+                        raw_summary,
+                        max_reasoning_chars=int(
+                            self.config.get("agent", "reasoning_tag_max_chars", default=12_000)
+                        ),
+                    )
+                    summary = filtered.text.strip()
+                    if not summary:
+                        raise RuntimeError("context summary model returned no visible text")
                     self._record_model_call(
-                        model=summary_model,
+                        model=summary_llm.model,
                         purpose="context_summary",
                         total_tokens=summary_tokens,
-                        started_at=locals().get("summary_started", monotonic()),
-                        status="failed",
-                        error=format_exception(exc),
+                        started_at=summary_started,
+                        status="completed",
                     )
-                if not fallback_enabled:
-                    raise
-                error = format_exception(exc)
+                    mode = "llm"
+                except Exception as exc:
+                    if summary_model:
+                        self._record_model_call(
+                            model=summary_model,
+                            purpose="context_summary",
+                            total_tokens=summary_tokens,
+                            started_at=locals().get("summary_started", monotonic()),
+                            status="failed",
+                            error=format_exception(exc),
+                        )
+                    if not fallback_enabled:
+                        raise
+                    error = format_exception(exc)
+                    summary = summarize_messages(old_messages)
+                    mode = "fallback"
+            else:
                 summary = summarize_messages(old_messages)
                 mode = "fallback"
-        else:
-            summary = summarize_messages(old_messages)
-            mode = "fallback"
 
-        self._total_tokens += summary_tokens
-        self._utility_tokens += summary_tokens
-        self._messages = build_compacted_messages(
-            system_messages,
-            summary,
-            recent_messages,
-        )
-        result = {
-            "mode": mode,
-            "summarized_messages": len(old_messages),
-            "summary_tokens": summary_tokens,
-            "summary_model": summary_model,
-        }
-        if error:
-            result["fallback_reason"] = error
-        self._last_compaction = result
-        self._trace_event("context_compaction", result)
-        return result
+            self._total_tokens += summary_tokens
+            self._utility_tokens += summary_tokens
+            self._messages = build_compacted_messages(
+                system_messages,
+                summary,
+                recent_messages,
+            )
+            result = {
+                "mode": mode,
+                "summarized_messages": len(old_messages),
+                "summary_tokens": summary_tokens,
+                "summary_model": summary_model,
+            }
+            if error:
+                result["fallback_reason"] = error
+            self._last_compaction = result
+            self._trace_event("context_compaction", result)
+            return result
 
     async def compact_context(self) -> dict[str, Any]:
         before_messages = len(self._messages)
@@ -1502,6 +1689,21 @@ class Agent:
             if self.store and self.session_id
             else 0
         )
+        project_memory_count = (
+            len(self.store.list_memories(scope="project", namespace=self._memory_namespace(), limit=200))
+            if self.store
+            else 0
+        )
+        user_memory_count = (
+            len(self.store.list_memories(scope="user", namespace="__user__", limit=200))
+            if self.store
+            else 0
+        )
+        open_revisions = (
+            len(self.store.list_file_revisions(self.session_id, limit=200))
+            if self.store and self.session_id
+            else 0
+        )
         return {
             "session_id": self.session_id,
             "run_status": self.run_state.status.value,
@@ -1522,6 +1724,9 @@ class Agent:
             "approval_mode": self.config.get("security", "approval_mode", default="auto"),
             "active_skills": list(self.active_skill_names),
             "open_tasks": open_tasks,
+            "project_memory_count": project_memory_count,
+            "user_memory_count": user_memory_count,
+            "file_revisions": open_revisions,
             "mcp_servers": sorted((self.config.get("mcp_servers", default={}) or {}).keys()),
             "storage_enabled": bool(storage.get("enabled", True)),
             "storage_path": storage.get("path") if storage.get("enabled", True) else None,
@@ -1534,6 +1739,9 @@ class Agent:
     def get_messages(self) -> list[dict]:
         """获取当前消息历史"""
         return list(self._messages)
+
+    def get_activity_label(self) -> str | None:
+        return self._activity_label
 
     def get_run_state(self) -> AgentRunState:
         return self.run_state

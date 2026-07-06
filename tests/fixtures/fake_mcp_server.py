@@ -19,7 +19,7 @@ for raw in sys.stdin:
     if method == "initialize":
         result = {
             "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
             "serverInfo": {"name": "fake", "version": "1"},
         }
     elif method == "tools/list":
@@ -43,6 +43,38 @@ for raw in sys.stdin:
                 "text": f"echo:{arguments.get('text', '')};pid:{os.getpid()}",
             }],
             "isError": False,
+        }
+    elif method == "resources/list":
+        result = {
+            "resources": [{
+                "uri": "memory://readme",
+                "name": "readme",
+                "mimeType": "text/plain",
+                "description": "demo resource",
+            }],
+        }
+    elif method == "resources/read":
+        result = {
+            "contents": [{
+                "uri": request.get("params", {}).get("uri", "memory://readme"),
+                "mimeType": "text/plain",
+                "text": "resource-body",
+            }],
+        }
+    elif method == "prompts/list":
+        result = {
+            "prompts": [{
+                "name": "summarize",
+                "description": "summarize input",
+            }],
+        }
+    elif method == "prompts/get":
+        params = request.get("params", {})
+        result = {
+            "messages": [{
+                "role": "user",
+                "content": {"type": "text", "text": f"prompt:{params.get('name')}"},
+            }],
         }
     else:
         response = {

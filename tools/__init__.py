@@ -7,6 +7,7 @@ from .risk import ApprovalDecision, ApprovalRequest, RiskLevel, ToolRisk
 from .provider import (
     CompositeToolProvider,
     LocalToolProvider,
+    MemoryToolProvider,
     MCPServerProvider,
     TaskToolProvider,
     ToolSearchProvider,
@@ -30,6 +31,7 @@ __all__ = [
     "ToolRisk",
     "ToolProvider",
     "LocalToolProvider",
+    "MemoryToolProvider",
     "MCPServerProvider",
     "TaskToolProvider",
     "ToolSearchProvider",

@@ -42,6 +42,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "instructions_filename": "AGENTS.md",
         "instructions_max_chars": 64000,
         "skill_max_chars": 32000,
+        "memory_max_entries": 8,
         "reasoning_tag_max_chars": 12000,
         "reasoning_recovery_attempts": 1,
         "refusal_review_enabled": True,

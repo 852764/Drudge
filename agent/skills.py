@@ -21,14 +21,27 @@ class Skill:
     path: Path
     instructions: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    references: list[tuple[str, str]] = field(default_factory=list)
+    scripts: dict[str, list[str]] = field(default_factory=dict)
 
     def render(self) -> str:
-        return (
+        parts = [
             f"SKILL: {self.name}\n"
             f"Description: {self.description}\n"
             f"Directory: {self.path.parent}\n"
             f"Instructions:\n{self.instructions}"
-        )
+        ]
+        if self.scripts:
+            lines = ["Workflow scripts:"]
+            for phase, commands in self.scripts.items():
+                lines.append(f"- {phase}: {len(commands)} command(s)")
+            parts.append("\n".join(lines))
+        if self.references:
+            lines = ["References:"]
+            for name, content in self.references:
+                lines.append(f"--- {name} ---\n{content}")
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
 
 
 class SkillManager:
@@ -76,6 +89,9 @@ class SkillManager:
             raise KeyError(f"Skill not found: {name}")
         return skill
 
+    def run_commands(self, skill: Skill, phase: str = "run") -> list[str]:
+        return list(skill.scripts.get(phase, []))
+
     def _load_file(self, path: Path) -> Skill:
         raw = path.read_text(encoding="utf-8")[: self.max_chars]
         metadata: dict[str, Any] = {}
@@ -100,4 +116,50 @@ class SkillManager:
             )[:240]
         if not instructions:
             raise ValueError(f"Skill has no instructions: {name}")
-        return Skill(name, description, path, instructions, metadata)
+        references = self._load_references(path.parent, metadata.get("references"))
+        scripts = self._normalize_scripts(metadata.get("scripts"))
+        return Skill(name, description, path, instructions, metadata, references, scripts)
+
+    def _load_references(self, root: Path, configured: Any) -> list[tuple[str, str]]:
+        if not configured:
+            return []
+        references: list[tuple[str, str]] = []
+        remaining = max(0, self.max_chars // 2)
+        items = configured if isinstance(configured, list) else [configured]
+        for item in items[:12]:
+            rel = str(item).strip()
+            if not rel:
+                continue
+            candidate = (root / rel).resolve()
+            if root.resolve() not in candidate.parents and candidate != root.resolve():
+                continue
+            if not candidate.is_file():
+                continue
+            try:
+                content = candidate.read_text(encoding="utf-8")[:remaining]
+            except (OSError, UnicodeDecodeError):
+                continue
+            if not content:
+                continue
+            references.append((rel, content))
+            remaining = max(0, remaining - len(content))
+            if remaining <= 0:
+                break
+        return references
+
+    @staticmethod
+    def _normalize_scripts(raw: Any) -> dict[str, list[str]]:
+        if not isinstance(raw, dict):
+            return {}
+        normalized: dict[str, list[str]] = {}
+        for phase, commands in raw.items():
+            if isinstance(commands, str):
+                items = [commands]
+            elif isinstance(commands, list):
+                items = [str(item) for item in commands if str(item).strip()]
+            else:
+                continue
+            clean = [item.strip() for item in items if item.strip()][:12]
+            if clean:
+                normalized[str(phase).strip().lower()] = clean
+        return normalized

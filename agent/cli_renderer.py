@@ -9,7 +9,7 @@ import sys
 import textwrap
 from dataclasses import dataclass
 from time import monotonic
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -76,8 +76,13 @@ class CliRenderer:
     def make_stream_printer(self, title: str = "Assistant") -> "StreamPrinter":
         return StreamPrinter(self, title=title)
 
-    def make_activity_ticker(self, label: str = "Thinking") -> "ActivityTicker":
-        return ActivityTicker(self, label=label)
+    def make_activity_ticker(
+        self,
+        label: str = "Thinking",
+        *,
+        state_getter: Callable[[], str] | None = None,
+    ) -> "ActivityTicker":
+        return ActivityTicker(self, label=label, state_getter=state_getter)
 
     def print_banner(
         self,
@@ -186,6 +191,9 @@ class CliRenderer:
                 ("Approval", local["approval_mode"]),
                 ("Skills", ", ".join(local["active_skills"]) or "(none)"),
                 ("Open tasks", local["open_tasks"]),
+                ("Project memories", local.get("project_memory_count", 0)),
+                ("User memories", local.get("user_memory_count", 0)),
+                ("Reversible edits", local.get("file_revisions", 0)),
                 ("MCP", ", ".join(local["mcp_servers"]) or "(none)"),
             ],
         )
@@ -243,6 +251,9 @@ class CliRenderer:
                 "/tasks [all]        List persistent session tasks",
                 "/task add <title>   Create a persistent task",
                 "/task start|done|cancel|reopen <id>",
+                "/memory [...]       Manage durable project/user memories",
+                "/changes            List reversible file changes",
+                "/undo               Revert the latest file change",
                 "/status             Show session, context, and account limits",
                 "/compact            Compact older conversation context",
                 "/resume <id>        Resume a saved session",
@@ -251,6 +262,7 @@ class CliRenderer:
                 "/skill <name>       Activate a skill",
                 "/skill off <name>   Deactivate a skill",
                 "/skill show <name>  Show skill metadata",
+                "/skill run <name>   Execute a skill workflow phase",
                 "/skill clear        Deactivate all skills",
                 "/clear              Clear screen",
             ],
@@ -435,22 +447,35 @@ class StreamPrinter:
 
 
 class ActivityTicker:
-    def __init__(self, renderer: CliRenderer, *, label: str = "Thinking") -> None:
+    def __init__(
+        self,
+        renderer: CliRenderer,
+        *,
+        label: str = "Thinking",
+        state_getter: Callable[[], str] | None = None,
+    ) -> None:
         self.renderer = renderer
         self.label = label
+        self.state_getter = state_getter
         self._stopped = asyncio.Event()
+        self._frames = ("-", "\\", "|", "/")
+        self._frame_index = 0
 
     async def run(self) -> None:
         started = monotonic()
         while not self._stopped.is_set():
             elapsed = int(monotonic() - started)
-            line = self.renderer._style(f"[{self.label} {elapsed}s]", self.renderer.theme.dim, bold=True)
+            label = self.state_getter() if self.state_getter is not None else self.label
+            frame = self._frames[self._frame_index % len(self._frames)]
+            self._frame_index += 1
+            line = self.renderer._style(f"[{frame} {label} {elapsed}s]", self.renderer.theme.dim, bold=True)
             self.renderer.show_status_line(line)
             try:
-                await asyncio.wait_for(self._stopped.wait(), timeout=1.0)
+                await asyncio.wait_for(self._stopped.wait(), timeout=0.12)
             except asyncio.TimeoutError:
                 continue
 
     def stop(self) -> None:
         self._stopped.set()
         self.renderer.clear_status_line()
+

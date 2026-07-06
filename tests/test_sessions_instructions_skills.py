@@ -188,6 +188,82 @@ Check correctness and run focused tests.
             self.assertEqual(info["active_skills"], ["review"])
             self.assertIn("review", resumed.active_skill_names)
 
+    def test_skill_references_render_and_scripts_run(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            skill_dir = Path(workspace, ".drudge", "skills", "review")
+            references_dir = skill_dir / "references"
+            references_dir.mkdir(parents=True)
+            (references_dir / "guide.md").write_text("Use focused tests first.", encoding="utf-8")
+            (skill_dir / "SKILL.md").write_text(
+                """---
+name: review
+description: Review source changes
+references:
+  - references/guide.md
+scripts:
+  run:
+    - echo skill-run
+---
+Check correctness and run focused tests.
+""",
+                encoding="utf-8",
+            )
+            db_path = str(Path(workspace, "drudge.db"))
+            config = configured(workspace, db_path)
+            config.override("toolsets", value=["terminal", "file"])
+            agent = Agent(config)
+            skill = agent.activate_skill("review")
+            agent.llm = FakeLLM([chat_response("reviewed")])
+
+            asyncio.run(agent.run("review this"))
+            results = asyncio.run(agent.run_skill_phase("review"))
+
+            self.assertEqual(skill.references[0][0], "references/guide.md")
+            system = agent.llm.requests[0]["messages"][0]["content"]
+            self.assertIn("Use focused tests first.", system)
+            self.assertTrue(results[0]["ok"])
+            self.assertIn("skill-run", results[0]["content"])
+
+    def test_persistent_memory_is_injected_into_system_prompt(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            db_path = str(Path(workspace, "drudge.db"))
+            config = configured(workspace, db_path)
+            agent = Agent(config)
+            agent.create_memory("The repo uses SQLite for session persistence.", scope="project", pinned=True)
+            agent.llm = FakeLLM([chat_response("done")])
+
+            asyncio.run(agent.run("How is session persistence implemented?"))
+
+            system = agent.llm.requests[0]["messages"][0]["content"]
+            self.assertIn("MEMORY (persistent notes)", system)
+            self.assertIn("SQLite for session persistence", system)
+
+    def test_file_revision_is_recorded_and_can_be_undone(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            db_path = str(Path(workspace, "drudge.db"))
+            config = configured(workspace, db_path)
+            target = Path(workspace, "note.txt")
+            target.write_text("before", encoding="utf-8")
+            fake = FakeLLM([
+                chat_response(
+                    finish_reason="tool_calls",
+                    tool_calls=[function_call("call-1", "write_file", '{"path":"note.txt","content":"after"}')],
+                ),
+                chat_response("updated"),
+            ])
+            agent = Agent(config)
+            agent.llm = fake
+
+            result = asyncio.run(agent.run("update the note"))
+            revisions = agent.list_file_revisions()
+            reverted = agent.undo_last_file_change()
+
+            self.assertEqual(result, "updated")
+            self.assertEqual(target.read_text(encoding="utf-8"), "before")
+            self.assertEqual(revisions[0]["path"], str(target))
+            self.assertIn("@@", revisions[0]["diff_summary"])
+            self.assertTrue(reverted["undone"])
+
 
 if __name__ == "__main__":
     unittest.main()

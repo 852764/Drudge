@@ -1,5 +1,6 @@
 """文件操作工具集 — read_file, write_file, search_files, patch"""
 
+import difflib
 import json
 import re
 from pathlib import Path
@@ -28,6 +29,56 @@ def _is_sensitive_path(path: Path) -> bool:
     parts = {part.lower() for part in path.parts}
     name = path.name.lower()
     return name == "auth.json" and ({".drudge", ".codex"} & parts)
+
+
+def _safe_read_text(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise
+    except OSError:
+        return None
+
+
+def _diff_summary(path: Path, before: str | None, after: str | None, *, limit: int = 24) -> str:
+    before_lines = (before or "").splitlines()
+    after_lines = (after or "").splitlines()
+    diff = list(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=str(path),
+            tofile=str(path),
+            lineterm="",
+        )
+    )
+    if not diff:
+        return ""
+    if len(diff) > limit:
+        diff = diff[:limit] + ["... (truncated)"]
+    return "\n".join(diff)
+
+
+def _record_file_change(
+    context: ToolContext | None,
+    *,
+    path: Path,
+    operation: str,
+    before_content: str | None,
+    after_content: str | None,
+    diff_summary: str,
+) -> None:
+    if context is None or context.record_file_change is None:
+        return
+    context.record_file_change({
+        "path": str(path),
+        "operation": operation,
+        "before_content": before_content,
+        "after_content": after_content,
+        "diff_summary": diff_summary,
+    })
 
 
 def read_file_handler(
@@ -83,20 +134,35 @@ def write_file_handler(
         filepath = _resolve_path(path, context)
     except PermissionError as e:
         return ToolResult.failure(str(e), blocked=True)
+    if _is_sensitive_path(filepath):
+        return ToolResult.failure("Editing credential files is blocked", blocked=True)
     if context is None:
         return ToolResult.failure("ToolContext is required", blocked=True)
     allowed, reason = context.mutation_allowed(f"write_file {filepath}")
     if not allowed:
         return ToolResult.failure(reason or "Write blocked", blocked=True)
     try:
+        before_content = _safe_read_text(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
-        return json.dumps({
+        diff_summary = _diff_summary(filepath, before_content, content)
+        _record_file_change(
+            context,
+            path=filepath,
+            operation="write_file",
+            before_content=before_content,
+            after_content=content,
+            diff_summary=diff_summary,
+        )
+        return {
             "success": True,
             "path": str(filepath),
             "size": len(content),
-        })
+            "changed": before_content != content,
+            "diff_summary": diff_summary,
+            "checkpoint_created": bool(context.record_file_change),
+        }
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -199,11 +265,22 @@ def patch_handler(
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(new_content)
-        return json.dumps({
+        diff_summary = _diff_summary(filepath, content, new_content)
+        _record_file_change(
+            context,
+            path=filepath,
+            operation="patch",
+            before_content=content,
+            after_content=new_content,
+            diff_summary=diff_summary,
+        )
+        return {
             "success": True,
             "path": str(filepath),
             "replacements": count,
-        })
+            "diff_summary": diff_summary,
+            "checkpoint_created": bool(context.record_file_change),
+        }
     except Exception as e:
         return json.dumps({"error": str(e)})
 

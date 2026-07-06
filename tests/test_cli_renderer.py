@@ -58,7 +58,33 @@ class CliRendererTests(unittest.TestCase):
         asyncio.run(run_ticker())
 
         output = stream.getvalue()
+        self.assertRegex(output, r"\[[\\\-/|] Thinking 0s\]")
         self.assertIn("Thinking 0s", output)
+
+    def test_activity_ticker_uses_dynamic_status_getter(self):
+        stream = _TTYBuffer()
+        renderer = CliRenderer(stream=stream, pretty=True, color=False, width=72, is_tty=True)
+        label = "Thinking"
+
+        def state_getter() -> str:
+            return label
+
+        ticker = renderer.make_activity_ticker("Thinking", state_getter=state_getter)
+
+        async def run_ticker() -> None:
+            nonlocal label
+            task = asyncio.create_task(ticker.run())
+            await asyncio.sleep(0.05)
+            label = "Running tool: read_file"
+            await asyncio.sleep(1.05)
+            ticker.stop()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(run_ticker())
+
+        output = stream.getvalue()
+        self.assertIn("Thinking 0s", output)
+        self.assertIn("Running tool: read_file", output)
 
     def test_status_renders_named_sections(self):
         stream = _TTYBuffer()

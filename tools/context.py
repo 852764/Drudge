@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 class ApprovalMode(str, Enum):
@@ -23,12 +23,19 @@ class ToolContext:
     allow_terminal: bool = True
     allow_network: bool = True
     approval_mode: str = ApprovalMode.AUTO.value
+    session_id: str | None = None
+    run_id: str | None = None
+    record_file_change: Callable[[dict[str, Any]], None] | None = None
 
     @classmethod
     def from_config(
         cls,
         security: dict[str, Any],
         toolsets: list[str],
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        record_file_change: Callable[[dict[str, Any]], None] | None = None,
     ) -> "ToolContext":
         workspace = Path(security.get("workspace_root") or os.getcwd()).expanduser().resolve()
         return cls(
@@ -38,6 +45,9 @@ class ToolContext:
             allow_terminal=bool(security.get("allow_terminal", True)),
             allow_network=bool(security.get("allow_network", True)),
             approval_mode=str(security.get("approval_mode", ApprovalMode.AUTO.value)),
+            session_id=session_id,
+            run_id=run_id,
+            record_file_change=record_file_change,
         )
 
     def allows_toolset(self, toolset: str) -> bool:

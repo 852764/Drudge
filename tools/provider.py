@@ -193,6 +193,135 @@ class TaskToolProvider(ToolProvider):
             return ToolResult.failure(str(exc)).to_json()
 
 
+class MemoryToolProvider(ToolProvider):
+    """Agent-owned persistent memory tools."""
+
+    name = "memory"
+
+    def __init__(
+        self,
+        list_memories: Callable[[str | None, int], list[dict[str, Any]]],
+        create_memory: Callable[..., dict[str, Any]],
+        update_memory: Callable[..., dict[str, Any]],
+        delete_memory: Callable[[int], bool],
+    ) -> None:
+        self._list = list_memories
+        self._create = create_memory
+        self._update = update_memory
+        self._delete = delete_memory
+        self._schemas = [
+            _function_schema(
+                "memory_list",
+                "List persistent user or project memories available to future turns.",
+                {
+                    "scope": {
+                        "type": "string",
+                        "description": "Optional scope filter",
+                        "enum": ["project", "user"],
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum memories to return",
+                        "default": 20,
+                    },
+                },
+                [],
+            ),
+            _function_schema(
+                "memory_create",
+                "Save a durable project or user memory for later retrieval.",
+                {
+                    "content": {"type": "string", "description": "Memory content"},
+                    "scope": {
+                        "type": "string",
+                        "description": "Memory scope",
+                        "enum": ["project", "user"],
+                    },
+                    "title": {"type": "string", "description": "Optional short label"},
+                    "pinned": {"type": "boolean", "description": "Keep this memory high priority"},
+                },
+                ["content"],
+            ),
+            _function_schema(
+                "memory_update",
+                "Update or pin an existing memory.",
+                {
+                    "memory_id": {"type": "integer", "description": "Memory numeric ID"},
+                    "content": {"type": "string", "description": "Optional replacement content"},
+                    "pinned": {"type": "boolean", "description": "Optional pin state"},
+                },
+                ["memory_id"],
+            ),
+            _function_schema(
+                "memory_delete",
+                "Delete an existing durable memory.",
+                {
+                    "memory_id": {"type": "integer", "description": "Memory numeric ID"},
+                },
+                ["memory_id"],
+            ),
+        ]
+
+    def schemas(self) -> list[dict[str, Any]]:
+        return list(self._schemas)
+
+    def tool_names(self) -> list[str]:
+        return ["memory_list", "memory_create", "memory_update", "memory_delete"]
+
+    def catalog(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": schema["function"]["name"],
+                "description": schema["function"].get("description", ""),
+                "category": "memory",
+                "provider": self.name,
+                "risk": "low",
+            }
+            for schema in self._schemas
+        ]
+
+    def owns(self, tool_name: str) -> bool:
+        return tool_name in self.tool_names()
+
+    def assess_risk(self, tool_name: str, args: dict, context: ToolContext) -> ToolRisk:
+        return ToolRisk(RiskLevel.LOW, "Agent-local durable memory metadata", tool_name)
+
+    async def call(
+        self,
+        tool_name: str,
+        args: dict,
+        context: ToolContext,
+        *,
+        approved: bool = False,
+    ) -> str:
+        try:
+            if tool_name == "memory_list":
+                value = self._list(
+                    str(args.get("scope")) if args.get("scope") else None,
+                    int(args.get("limit", 20)),
+                )
+            elif tool_name == "memory_create":
+                value = self._create(
+                    str(args.get("content", "")),
+                    scope=str(args.get("scope") or "project"),
+                    title=str(args.get("title") or ""),
+                    pinned=bool(args.get("pinned", False)),
+                )
+            elif tool_name == "memory_update":
+                value = self._update(
+                    int(args["memory_id"]),
+                    pinned=args.get("pinned") if "pinned" in args else None,
+                    content=str(args.get("content")) if args.get("content") is not None else None,
+                )
+            elif tool_name == "memory_delete":
+                value = {"deleted": self._delete(int(args["memory_id"]))}
+            else:
+                return ToolResult.failure(f"Unknown memory tool: {tool_name}").to_json()
+            return ToolResult.success(json.dumps(value, ensure_ascii=False)).to_json()
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            return ToolResult.failure(str(exc)).to_json()
+
+
 class ToolSearchProvider(ToolProvider):
     """Always-small meta tool that activates omitted tools for the current turn."""
 
@@ -281,6 +410,10 @@ class MCPServerProvider(ToolProvider):
         self._stderr_lines: list[str] = []
         self._next_id = 1
         self._tools: dict[str, dict[str, Any]] = {}
+        self._capabilities: dict[str, Any] = {}
+        self._resources: list[dict[str, Any]] = []
+        self._resource_templates: list[dict[str, Any]] = []
+        self._prompts: list[dict[str, Any]] = []
         self._error: str | None = None
 
     async def start(self) -> None:
@@ -307,7 +440,7 @@ class MCPServerProvider(ToolProvider):
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         try:
-            await self._request(
+            initialized = await self._request(
                 "initialize",
                 {
                     "protocolVersion": "2024-11-05",
@@ -315,8 +448,10 @@ class MCPServerProvider(ToolProvider):
                     "clientInfo": {"name": "drudge", "version": "0.1.0"},
                 },
             )
+            self._capabilities = dict(initialized.get("capabilities") or {})
             await self._notify("notifications/initialized", {})
             await self._load_tools()
+            await self._load_optional_capabilities()
             self._error = None
         except Exception:
             await self.close()
@@ -325,6 +460,10 @@ class MCPServerProvider(ToolProvider):
     async def close(self) -> None:
         process = self.process
         self.process = None
+        self._tools = {}
+        self._resources = []
+        self._resource_templates = []
+        self._prompts = []
         if process:
             if process.stdin:
                 process.stdin.close()
@@ -355,10 +494,47 @@ class MCPServerProvider(ToolProvider):
                     "parameters": parameters,
                 },
             })
+        if self._resources:
+            schemas.append(_function_schema(_mcp_tool_name(self.namespace, "list_resources"), f"List readable MCP resources from server '{self.name}'.", {}, []))
+            schemas.append(_function_schema(
+                _mcp_tool_name(self.namespace, "read_resource"),
+                f"Read an MCP resource from server '{self.name}'. Use a URI returned by list_resources.",
+                {"uri": {"type": "string", "description": "Resource URI"}},
+                ["uri"],
+            ))
+        if self._prompts:
+            schemas.append(_function_schema(_mcp_tool_name(self.namespace, "list_prompts"), f"List reusable MCP prompts from server '{self.name}'.", {}, []))
+            schemas.append({
+                "type": "function",
+                "function": {
+                    "name": _mcp_tool_name(self.namespace, "get_prompt"),
+                    "description": f"Resolve an MCP prompt from server '{self.name}'.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string", "description": "Prompt name"},
+                            "arguments": {"type": "object", "description": "Optional prompt arguments"},
+                        },
+                        "required": ["name"],
+                        "additionalProperties": False,
+                    },
+                },
+            })
         return schemas
 
     def tool_names(self) -> list[str]:
-        return list(self._tools)
+        names = list(self._tools)
+        if self._resources:
+            names.extend([
+                _mcp_tool_name(self.namespace, "list_resources"),
+                _mcp_tool_name(self.namespace, "read_resource"),
+            ])
+        if self._prompts:
+            names.extend([
+                _mcp_tool_name(self.namespace, "list_prompts"),
+                _mcp_tool_name(self.namespace, "get_prompt"),
+            ])
+        return names
 
     def catalog(self) -> list[dict[str, Any]]:
         return [
@@ -370,10 +546,19 @@ class MCPServerProvider(ToolProvider):
                 "risk": self.risk.value,
             }
             for exposed_name, tool in self._tools.items()
+        ] + [
+            {
+                "name": name,
+                "description": description,
+                "category": f"mcp:{self.name}",
+                "provider": self.name,
+                "risk": self.risk.value,
+            }
+            for name, description in self._virtual_catalog_items()
         ]
 
     def owns(self, tool_name: str) -> bool:
-        return tool_name in self._tools
+        return tool_name in self._tools or tool_name in {name for name, _ in self._virtual_catalog_items()}
 
     def assess_risk(self, tool_name: str, args: dict, context: ToolContext) -> ToolRisk:
         return ToolRisk(
@@ -392,6 +577,7 @@ class MCPServerProvider(ToolProvider):
     ) -> str:
         if not self.owns(tool_name):
             return ToolResult.failure(f"Unknown MCP tool: {tool_name}").to_json()
+        await self._ensure_connected()
         risk = self.assess_risk(tool_name, args, context)
         if context.approval_mode == "never" and risk.requires_approval:
             return ToolResult.failure(
@@ -406,6 +592,28 @@ class MCPServerProvider(ToolProvider):
                 approval_required=True,
                 risk=risk.level.value,
             ).to_json()
+        if tool_name == _mcp_tool_name(self.namespace, "list_resources"):
+            return ToolResult.success(json.dumps(self._resources, ensure_ascii=False), server=self.name).to_json()
+        if tool_name == _mcp_tool_name(self.namespace, "read_resource"):
+            try:
+                result = await self._request("resources/read", {"uri": str(args.get("uri") or "")})
+            except Exception as exc:
+                return ToolResult.failure(f"MCP resource read failed: {exc}", server=self.name).to_json()
+            return _mcp_resource_result(result, self.name)
+        if tool_name == _mcp_tool_name(self.namespace, "list_prompts"):
+            return ToolResult.success(json.dumps(self._prompts, ensure_ascii=False), server=self.name).to_json()
+        if tool_name == _mcp_tool_name(self.namespace, "get_prompt"):
+            try:
+                result = await self._request(
+                    "prompts/get",
+                    {
+                        "name": str(args.get("name") or ""),
+                        "arguments": args.get("arguments") or {},
+                    },
+                )
+            except Exception as exc:
+                return ToolResult.failure(f"MCP prompt resolution failed: {exc}", server=self.name).to_json()
+            return _mcp_prompt_result(result, self.name)
         original_name = str(self._tools[tool_name]["name"])
         try:
             result = await self._request("tools/call", {"name": original_name, "arguments": args})
@@ -420,9 +628,27 @@ class MCPServerProvider(ToolProvider):
             "transport": "stdio",
             "connected": connected,
             "tools": self.tool_names(),
+            "capabilities": {
+                "tools": bool(self._tools),
+                "resources": bool(self._resources),
+                "resource_templates": bool(self._resource_templates),
+                "prompts": bool(self._prompts),
+            },
+            "resource_count": len(self._resources),
+            "prompt_count": len(self._prompts),
             "error": self._error,
             "stderr": self._stderr_lines[-5:],
         }
+
+    def _virtual_catalog_items(self) -> list[tuple[str, str]]:
+        items: list[tuple[str, str]] = []
+        if self._resources:
+            items.append((_mcp_tool_name(self.namespace, "list_resources"), f"List readable resources from MCP server '{self.name}'"))
+            items.append((_mcp_tool_name(self.namespace, "read_resource"), f"Read one MCP resource from server '{self.name}'"))
+        if self._prompts:
+            items.append((_mcp_tool_name(self.namespace, "list_prompts"), f"List reusable prompts from MCP server '{self.name}'"))
+            items.append((_mcp_tool_name(self.namespace, "get_prompt"), f"Resolve one reusable MCP prompt from server '{self.name}'"))
+        return items
 
     async def _load_tools(self) -> None:
         cursor: str | None = None
@@ -444,6 +670,53 @@ class MCPServerProvider(ToolProvider):
                 digest = hashlib.sha1(original.encode("utf-8")).hexdigest()[:8]
                 exposed = f"{exposed[:55]}_{digest}"
             self._tools[exposed] = dict(tool)
+
+    async def _load_optional_capabilities(self) -> None:
+        if "resources" in self._capabilities:
+            try:
+                await self._load_resources()
+            except Exception:
+                self._resources = []
+                self._resource_templates = []
+        if "prompts" in self._capabilities:
+            try:
+                await self._load_prompts()
+            except Exception:
+                self._prompts = []
+
+    async def _load_resources(self) -> None:
+        cursor: str | None = None
+        resources: list[dict[str, Any]] = []
+        templates: list[dict[str, Any]] = []
+        while True:
+            params = {"cursor": cursor} if cursor else {}
+            result = await self._request("resources/list", params)
+            resources.extend(result.get("resources") or [])
+            templates.extend(result.get("resourceTemplates") or [])
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        self._resources = [item for item in resources if isinstance(item, dict)]
+        self._resource_templates = [item for item in templates if isinstance(item, dict)]
+
+    async def _load_prompts(self) -> None:
+        cursor: str | None = None
+        prompts: list[dict[str, Any]] = []
+        while True:
+            params = {"cursor": cursor} if cursor else {}
+            result = await self._request("prompts/list", params)
+            prompts.extend(result.get("prompts") or [])
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        self._prompts = [item for item in prompts if isinstance(item, dict)]
+
+    async def _ensure_connected(self) -> None:
+        if self.process and self.process.returncode is None:
+            return
+        if not self.config.get("auto_restart", True):
+            raise RuntimeError(f"MCP server '{self.name}' is not connected")
+        await self.start()
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.process or not self.process.stdin or not self.process.stdout:
@@ -564,11 +837,14 @@ def create_tool_provider(
     workspace: str | Path,
     *,
     task_provider: ToolProvider | None = None,
+    memory_provider: ToolProvider | None = None,
     search_provider: ToolProvider | None = None,
 ) -> CompositeToolProvider:
     providers: list[ToolProvider] = [LocalToolProvider(registry, toolsets)]
     if task_provider is not None:
         providers.append(task_provider)
+    if memory_provider is not None:
+        providers.append(memory_provider)
     if search_provider is not None:
         providers.append(search_provider)
     for name, server_config in (mcp_servers or {}).items():
@@ -630,3 +906,37 @@ def _mcp_result(result: dict[str, Any], server: str) -> str:
     if result.get("isError"):
         return ToolResult.failure(content or "MCP tool returned an error", server=server).to_json()
     return ToolResult.success(content, server=server).to_json()
+
+
+def _mcp_resource_result(result: dict[str, Any], server: str) -> str:
+    contents = result.get("contents") or []
+    parts: list[str] = []
+    for item in contents:
+        if not isinstance(item, dict):
+            parts.append(str(item))
+            continue
+        text = item.get("text")
+        if text:
+            parts.append(str(text))
+            continue
+        blob = item.get("blob")
+        if blob:
+            parts.append(f"[blob {item.get('mimeType', 'unknown')}: {str(blob)[:120]}]")
+            continue
+        parts.append(json.dumps(item, ensure_ascii=False))
+    return ToolResult.success("\n".join(part for part in parts if part), server=server).to_json()
+
+
+def _mcp_prompt_result(result: dict[str, Any], server: str) -> str:
+    messages = result.get("messages") or []
+    parts: list[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            parts.append(str(message))
+            continue
+        content = message.get("content")
+        if isinstance(content, dict) and content.get("type") == "text":
+            parts.append(str(content.get("text") or ""))
+        else:
+            parts.append(json.dumps(message, ensure_ascii=False))
+    return ToolResult.success("\n".join(part for part in parts if part), server=server).to_json()
