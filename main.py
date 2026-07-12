@@ -213,7 +213,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the login URL without opening a browser",
     )
-    subparsers.add_parser("doctor", help="Check Drudge configuration, auth, tools, and workspace state")
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check Drudge configuration, auth, tools, and workspace state",
+    )
+    doctor_parser.add_argument(
+        "--probe-model",
+        nargs="?",
+        const="",
+        metavar="MODEL",
+        help="Probe Chat, Responses, tools, and streaming support for a model",
+    )
+    doctor_parser.add_argument(
+        "--probe-json",
+        action="store_true",
+        help="Print provider probe results as JSON",
+    )
+    doctor_parser.add_argument(
+        "--no-probe-streaming",
+        action="store_true",
+        help="Skip streaming checks during provider probing",
+    )
     status_parser = subparsers.add_parser("status", help="Show session status and Codex limits")
     status_parser.add_argument(
         "--json",
@@ -268,6 +288,7 @@ async def run_query(
         config.enable_codex_oauth()
     if approval_mode:
         config.override("security", "approval_mode", value=approval_mode)
+
     _validate_runtime_config(config)
     agent = Agent(config, approval_callback=ConsoleApproval())
     _attach_renderer(agent, renderer)
@@ -971,6 +992,9 @@ def run_doctor(
     codex_config_path: str | None = None,
     codex_oauth: bool = False,
     approval_mode: str | None = None,
+    probe_model: str | None = None,
+    probe_json: bool = False,
+    probe_streaming: bool = True,
 ) -> None:
     config = get_config(config_path, codex_config_path)
     if model:
@@ -981,6 +1005,14 @@ def run_doctor(
         config.enable_codex_oauth()
     if approval_mode:
         config.override("security", "approval_mode", value=approval_mode)
+
+    if probe_model is not None and probe_json:
+        report = _run_provider_probe(config, probe_model, probe_streaming)
+        if report is None:
+            print(json.dumps({"error": "Provider probe is not available for Codex OAuth."}))
+        else:
+            print(report.to_json())
+        return
 
     print(f"Drudge v{VERSION} doctor")
     print(f"Python: {sys.version.split()[0]}")
@@ -1060,6 +1092,28 @@ def run_doctor(
         for line in git_summary:
             print(f"  {line}")
 
+    if probe_model is not None:
+        report = _run_provider_probe(config, probe_model, probe_streaming)
+        if report is None:
+            print("Provider probe is not available for Codex OAuth.")
+            return
+        from agent.provider_probe import format_probe_report
+
+        print(format_probe_report(report))
+
+
+def _run_provider_probe(config, probe_model: str, probe_streaming: bool):
+    if config.get("model", "provider") == "openai-codex":
+        return None
+    from agent.provider_probe import probe_provider
+
+    target_model = probe_model or str(config.get("model", "name"))
+    return asyncio.run(probe_provider(
+        config.get_model_config(),
+        model=target_model,
+        include_streaming=probe_streaming,
+    ))
+
 
 def _git_status_summary(workspace: Path) -> list[str]:
     try:
@@ -1092,6 +1146,9 @@ def main():
             args.codex_config,
             args.codex_oauth,
             args.approval_mode,
+            getattr(args, "probe_model", None),
+            getattr(args, "probe_json", False),
+            not getattr(args, "no_probe_streaming", False),
         )
         return
     if args.command == "status":
