@@ -199,6 +199,49 @@ class AgentLoopTests(unittest.TestCase):
             self.assertEqual(second_messages[-1]["role"], "tool")
             self.assertIn("hello", second_messages[-1]["content"])
 
+    def test_runtime_plan_tool_updates_current_plan(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            Path(workspace, "sample.txt").write_text("hello", encoding="utf-8")
+            fake = FakeLLM([
+                chat_response(
+                    finish_reason="tool_calls",
+                    tool_calls=[function_call(
+                        "plan-1",
+                        "update_plan",
+                        '{"plan":[{"step":"Inspect sample file","status":"in_progress"},'
+                        '{"step":"Report result","status":"pending"}],'
+                        '"explanation":"Need file context first"}',
+                    )],
+                ),
+                chat_response(
+                    finish_reason="tool_calls",
+                    tool_calls=[function_call("call-1", "read_file", '{"path":"sample.txt"}')],
+                ),
+                chat_response(
+                    finish_reason="tool_calls",
+                    tool_calls=[function_call(
+                        "plan-2",
+                        "update_plan",
+                        '{"plan":[{"step":"Inspect sample file","status":"completed"},'
+                        '{"step":"Report result","status":"completed"}]}',
+                    )],
+                ),
+                chat_response("sample contains hello"),
+            ])
+            agent = Agent(test_config(workspace))
+            agent.llm = fake
+
+            result = asyncio.run(agent.run("read sample.txt with a plan"))
+
+            self.assertEqual(result, "sample contains hello")
+            self.assertEqual(agent.get_plan(), [
+                {"step": "Inspect sample file", "status": "completed"},
+                {"step": "Report result", "status": "completed"},
+            ])
+            self.assertEqual(agent.get_status()["last_plan_explanation"], None)
+            first_tools = [tool["function"]["name"] for tool in fake.requests[0]["tools"]]
+            self.assertIn("update_plan", first_tools)
+
     def test_max_turns_is_explicit_state(self):
         with tempfile.TemporaryDirectory() as workspace:
             Path(workspace, "sample.txt").write_text("hello", encoding="utf-8")

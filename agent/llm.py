@@ -26,6 +26,8 @@ class LLMClient:
         query_params: dict[str, Any] | None = None,
         timeout: int = 120,
         max_retries: int = 3,
+        reasoning_effort: str | None = None,
+        disable_response_storage: bool = False,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self.base_url = base_url.rstrip("/")
@@ -39,6 +41,8 @@ class LLMClient:
         self.query_params = dict(query_params or {})
         self.timeout = timeout
         self.max_retries = max_retries
+        self.reasoning_effort = reasoning_effort
+        self.disable_response_storage = disable_response_storage
         self._transport = transport
 
     async def chat(
@@ -142,6 +146,7 @@ class LLMClient:
             "temperature": self.temperature,
             "max_output_tokens": self.max_tokens,
         }
+        self._apply_responses_options(body)
         if tools:
             body["tools"] = self._tools_to_responses_tools(tools)
             body["tool_choice"] = tool_choice or "auto"
@@ -303,6 +308,7 @@ class LLMClient:
             "max_output_tokens": self.max_tokens,
             "stream": True,
         }
+        self._apply_responses_options(body)
         if tools:
             body["tools"] = self._tools_to_responses_tools(tools)
             body["tool_choice"] = tool_choice or "auto"
@@ -427,6 +433,12 @@ class LLMClient:
         if alias and alias not in models:
             models.append(alias)
         return models
+
+    def _apply_responses_options(self, body: dict[str, Any]) -> None:
+        if self.reasoning_effort:
+            body["reasoning"] = {"effort": self.reasoning_effort}
+        if self.disable_response_storage:
+            body["store"] = False
 
     @staticmethod
     def _messages_to_chat_input(messages: list[dict]) -> list[dict]:
@@ -608,4 +620,6 @@ def create_client(config: dict) -> LLMClient:
         default_headers=config.get("headers", {}),
         query_params=config.get("query_params", {}),
         max_retries=config.get("max_retries", 3),
+        reasoning_effort=config.get("reasoning_effort"),
+        disable_response_storage=bool(config.get("disable_response_storage", False)),
     )

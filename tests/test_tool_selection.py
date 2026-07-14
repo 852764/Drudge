@@ -67,12 +67,13 @@ class ToolSelectionTests(unittest.TestCase):
 
             self.assertEqual(result, "done")
             names = [tool["function"]["name"] for tool in primary.requests[0]["tools"]]
-            self.assertEqual(names, ["read_file", "tool_search"])
+            self.assertEqual(names, ["read_file", "update_plan", "tool_search"])
             self.assertIsNone(selector.requests[0]["tools"])
             self.assertNotIn("inputSchema", selector.requests[0]["messages"][1]["content"])
             self.assertEqual(agent.get_token_usage()["total_tokens"], 20)
             self.assertEqual(agent.get_token_usage()["utility_tokens"], 10)
             self.assertEqual(agent.get_status()["last_tool_selection"]["mode"], "llm")
+            self.assertNotIn("update_plan", selector.requests[0]["messages"][1]["content"])
 
     def test_selector_failure_uses_deterministic_fallback(self):
         with tempfile.TemporaryDirectory() as workspace:
@@ -123,6 +124,7 @@ class ToolSelectionTests(unittest.TestCase):
             self.assertNotIn("terminal", first_names)
             self.assertIn("terminal", second_names)
             self.assertIn("tool_search", second_names)
+            self.assertIn("update_plan", second_names)
             self.assertIn("activated", primary.requests[1]["messages"][-1]["content"])
 
     def test_below_threshold_sends_all_without_tool_search_or_selector_call(self):
@@ -137,6 +139,7 @@ class ToolSelectionTests(unittest.TestCase):
 
             names = [tool["function"]["name"] for tool in primary.requests[0]["tools"]]
             self.assertIn("terminal", names)
+            self.assertIn("update_plan", names)
             self.assertNotIn("tool_search", names)
             self.assertEqual(selector.requests, [])
             self.assertEqual(agent.get_status()["last_tool_selection"]["mode"], "all")

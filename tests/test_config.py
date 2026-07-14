@@ -12,6 +12,21 @@ from config import ConfigManager
 
 
 class ConfigTests(unittest.TestCase):
+    def test_default_model_uses_local_custom_responses_provider(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "ignored-openai-key"}):
+            config = ConfigManager()
+        model = config.get_model_config()
+
+        self.assertEqual(model["provider"], "custom")
+        self.assertEqual(model["name"], "gpt-5.5")
+        self.assertEqual(model["base_url"], "http://127.0.0.1:8318/v1")
+        self.assertEqual(model["api"], "responses")
+        self.assertEqual(model["api_key"], "")
+        self.assertEqual(model["api_key_env"], "DRUDGE_API_KEY")
+        self.assertEqual(model["reasoning_effort"], "high")
+        self.assertTrue(model["disable_response_storage"])
+        self.assertFalse(model["allow_unauthenticated"])
+
     def test_safe_dict_redacts_secrets_without_mutating_config(self):
         config = ConfigManager()
         config.override("model", "api_key", value="secret-key")
@@ -31,6 +46,8 @@ class ConfigTests(unittest.TestCase):
 model = "relay-model"
 model_provider = "relay"
 model_context_window = 200000
+model_reasoning_effort = "high"
+disable_response_storage = true
 
 [model_providers.relay]
 name = "Relay"
@@ -57,6 +74,8 @@ request_max_retries = 5
             self.assertEqual(model["api_key"], "relay-secret")
             self.assertEqual(model["api"], "responses")
             self.assertEqual(model["context_length"], 200000)
+            self.assertEqual(model["reasoning_effort"], "high")
+            self.assertTrue(model["disable_response_storage"])
             self.assertEqual(model["headers"]["X-Feature"], "feature-value")
             self.assertEqual(model["query_params"]["api-version"], "2026-01-01")
             self.assertEqual(model["max_retries"], 5)

@@ -131,7 +131,7 @@ class CliRendererTests(unittest.TestCase):
         self.assertIn("Tool Selection", output)
         self.assertIn("Codex Account Usage", output)
 
-    def test_tool_event_renders_indented_sidebar_panel(self):
+    def test_tool_event_renders_left_aligned_full_width_panel(self):
         stream = _TTYBuffer()
         renderer = CliRenderer(stream=stream, pretty=True, color=False, width=96, is_tty=True)
 
@@ -142,6 +142,7 @@ class CliRendererTests(unittest.TestCase):
         self.assertIn("tool: read_file", output)
         self.assertIn("args:", output)
         self.assertIn("result:", output)
+        self.assertTrue(output.startswith("+- Tool Log"))
 
     def test_code_block_uses_ansi_highlighting_when_color_enabled(self):
         stream = _TTYBuffer()

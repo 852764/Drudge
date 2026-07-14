@@ -193,6 +193,117 @@ class TaskToolProvider(ToolProvider):
             return ToolResult.failure(str(exc)).to_json()
 
 
+class PlanToolProvider(ToolProvider):
+    """Agent-owned runtime plan tool."""
+
+    name = "plan"
+    _statuses = {"pending", "in_progress", "completed"}
+
+    def __init__(
+        self,
+        update_plan: Callable[[list[dict[str, str]], str], dict[str, Any]],
+    ) -> None:
+        self._update = update_plan
+        self._schema = {
+            "type": "function",
+            "function": {
+                "name": "update_plan",
+                "description": (
+                    "Replace the current runtime plan for complex work. Use it to list "
+                    "ordered steps and update their status as work progresses."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "plan": {
+                            "type": "array",
+                            "description": "Ordered plan items.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "step": {
+                                        "type": "string",
+                                        "description": "Short concrete step.",
+                                    },
+                                    "status": {
+                                        "type": "string",
+                                        "description": "Current step status.",
+                                        "enum": ["pending", "in_progress", "completed"],
+                                    },
+                                },
+                                "required": ["step", "status"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "explanation": {
+                            "type": "string",
+                            "description": "Optional short reason for this plan update.",
+                        },
+                    },
+                    "required": ["plan"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def schemas(self) -> list[dict[str, Any]]:
+        return [self._schema]
+
+    def tool_names(self) -> list[str]:
+        return ["update_plan"]
+
+    def catalog(self) -> list[dict[str, Any]]:
+        return [{
+            "name": "update_plan",
+            "description": self._schema["function"]["description"],
+            "category": "core",
+            "provider": self.name,
+            "risk": "low",
+        }]
+
+    def owns(self, tool_name: str) -> bool:
+        return tool_name == "update_plan"
+
+    def assess_risk(self, tool_name: str, args: dict, context: ToolContext) -> ToolRisk:
+        return ToolRisk(RiskLevel.LOW, "Agent-local runtime plan metadata", tool_name)
+
+    async def call(
+        self,
+        tool_name: str,
+        args: dict,
+        context: ToolContext,
+        *,
+        approved: bool = False,
+    ) -> str:
+        try:
+            if tool_name != "update_plan":
+                return ToolResult.failure(f"Unknown plan tool: {tool_name}").to_json()
+            raw_plan = args.get("plan")
+            if not isinstance(raw_plan, list):
+                raise ValueError("plan must be an array")
+            plan: list[dict[str, str]] = []
+            for index, item in enumerate(raw_plan, 1):
+                if not isinstance(item, dict):
+                    raise ValueError(f"plan item {index} must be an object")
+                step = str(item.get("step") or "").strip()
+                status = str(item.get("status") or "").strip()
+                if not step:
+                    raise ValueError(f"plan item {index} step cannot be empty")
+                if status not in self._statuses:
+                    raise ValueError(f"plan item {index} has invalid status: {status}")
+                plan.append({"step": step, "status": status})
+            in_progress = sum(1 for item in plan if item["status"] == "in_progress")
+            completed = all(item["status"] == "completed" for item in plan) if plan else True
+            if in_progress > 1:
+                raise ValueError("at most one plan item can be in_progress")
+            if plan and not completed and in_progress != 1:
+                raise ValueError("exactly one plan item must be in_progress until all are completed")
+            value = self._update(plan, str(args.get("explanation") or ""))
+            return ToolResult.success(json.dumps(value, ensure_ascii=False)).to_json()
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return ToolResult.failure(str(exc)).to_json()
+
+
 class MemoryToolProvider(ToolProvider):
     """Agent-owned persistent memory tools."""
 
@@ -837,12 +948,15 @@ def create_tool_provider(
     workspace: str | Path,
     *,
     task_provider: ToolProvider | None = None,
+    plan_provider: ToolProvider | None = None,
     memory_provider: ToolProvider | None = None,
     search_provider: ToolProvider | None = None,
 ) -> CompositeToolProvider:
     providers: list[ToolProvider] = [LocalToolProvider(registry, toolsets)]
     if task_provider is not None:
         providers.append(task_provider)
+    if plan_provider is not None:
+        providers.append(plan_provider)
     if memory_provider is not None:
         providers.append(memory_provider)
     if search_provider is not None:

@@ -40,6 +40,21 @@ class QueueResponsesClient(CapturingResponsesClient):
 
 
 class ResponsesAdapterTests(unittest.TestCase):
+    def test_responses_options_include_reasoning_and_store_flag(self):
+        client = CapturingResponsesClient({
+            "id": "resp-1",
+            "model": "fake",
+            "status": "completed",
+            "output": [],
+        })
+        client.reasoning_effort = "high"
+        client.disable_response_storage = True
+
+        asyncio.run(client.chat([{"role": "user", "content": "think deeply"}]))
+
+        self.assertEqual(client.last_body["reasoning"], {"effort": "high"})
+        self.assertIs(client.last_body["store"], False)
+
     def test_responses_tools_are_flat_and_tool_calls_are_normalized(self):
         client = CapturingResponsesClient({
             "id": "resp-1",

@@ -149,8 +149,6 @@ class CliRenderer:
         self.print_panel(title, text.splitlines() or [""], accent=self.theme.title)
 
     def print_tool_event(self, name: str, args: dict[str, Any] | None, result: str | None) -> None:
-        panel_width = min(48, max(32, self.width // 2))
-        indent = max(0, self.width - panel_width - 4)
         lines = [f"tool: {name}"]
         if args:
             lines.append("args:")
@@ -163,8 +161,7 @@ class CliRenderer:
                 "Tool Log",
                 lines,
                 accent=self.theme.accent,
-                panel_width=panel_width,
-                indent=indent,
+                panel_width=self.width,
             )
         )
 

@@ -28,6 +28,8 @@ Drudge 只读取模型调用需要的安全子集：
 - `query_params`
 - `request_max_retries`
 - `model_context_window`
+- `model_reasoning_effort`
+- `disable_response_storage`
 
 Drudge 的 `--codex-config` 不读取 Codex 的 `auth.json`，也不会复用 Codex CLI 的 ChatGPT 登录 Token。Codex command-backed provider auth 暂不执行；请改用 `env_key` 或 `env_http_headers`。
 
@@ -38,6 +40,8 @@ Drudge 的 `--codex-config` 不读取 Codex 的 `auth.json`，也不会复用 Co
 ```toml
 model = "gpt-5.5"
 model_provider = "relay"
+model_reasoning_effort = "high"
+disable_response_storage = true
 
 [model_providers.relay]
 name = "Relay"

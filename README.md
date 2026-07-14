@@ -22,17 +22,21 @@ pip install -e .
 默认读取环境变量：
 
 ```bash
-set OPENAI_API_KEY=your_api_key
-set DRUDGE_MODEL=gpt-4o-mini
-set DRUDGE_BASE_URL=https://api.openai.com/v1
+set DRUDGE_API_KEY=your_local_proxy_api_key
+set DRUDGE_MODEL=gpt-5.5
+set DRUDGE_BASE_URL=http://127.0.0.1:8318/v1
 ```
 
 也可以传入 YAML 配置：
 
 ```yaml
 model:
-  name: gpt-4o-mini
-  base_url: https://api.openai.com/v1
+  provider: custom
+  name: gpt-5.5
+  base_url: http://127.0.0.1:8318/v1
+  api: responses
+  reasoning_effort: high
+  disable_response_storage: true
   api_key: your_api_key
 toolsets:
   - terminal

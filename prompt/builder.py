@@ -86,6 +86,9 @@ def _tool_usage_instructions(toolsets: list[str]) -> str:
 
 Tool usage rules:
 - Call tools directly when you need to take action.
+- For complex or multi-step tasks, call update_plan first with a short ordered plan.
+- Keep the plan current: exactly one step should be in_progress until all steps are completed.
+- After completing a planned step, call update_plan again before moving to the next step.
 - Each tool call returns a result that you can use in your response.
 - If a tool call fails, examine the error and try an alternative approach.
 - Prefer apply_patch for source edits instead of rewriting whole files.

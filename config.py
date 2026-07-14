@@ -18,13 +18,18 @@ except ModuleNotFoundError:  # Python 3.10
 DEFAULT_CONFIG: dict[str, Any] = {
     "model": {
         "name": os.getenv("DRUDGE_MODEL", "gpt-5.5"),
-        "base_url": os.getenv("DRUDGE_BASE_URL", "https://anyrouter.top/v1"),
-        "api_key": os.getenv("OPENAI_API_KEY", os.getenv("DRUDGE_API_KEY", "")),
+        "provider": os.getenv("DRUDGE_MODEL_PROVIDER", "custom"),
+        "base_url": os.getenv("DRUDGE_BASE_URL", "http://127.0.0.1:8318/v1"),
+        "api_key": os.getenv("DRUDGE_API_KEY", ""),
+        "api_key_env": "DRUDGE_API_KEY",
         "temperature": 0.7,
         "max_tokens": 4096,
         "context_length": 128000,
         "max_retries": 3,
-        "api": os.getenv("DRUDGE_MODEL_API", "auto"),
+        "api": os.getenv("DRUDGE_MODEL_API", "responses"),
+        "reasoning_effort": os.getenv("DRUDGE_MODEL_REASONING_EFFORT", "high"),
+        "disable_response_storage": True,
+        "allow_unauthenticated": False,
         "aliases": {},
     },
     # Optional low-cost model for context summaries and other background tasks.
@@ -141,6 +146,12 @@ class ConfigManager:
             model_update["name"] = effective["model"]
         if effective.get("model_context_window"):
             model_update["context_length"] = effective["model_context_window"]
+        if effective.get("model_reasoning_effort"):
+            model_update["reasoning_effort"] = effective["model_reasoning_effort"]
+        if "disable_response_storage" in effective:
+            model_update["disable_response_storage"] = bool(
+                effective["disable_response_storage"]
+            )
 
         if provider_id == "openai":
             model_update["base_url"] = effective.get(

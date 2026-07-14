@@ -40,6 +40,7 @@ from tools import (
     ApprovalDecision,
     ApprovalRequest,
     MemoryToolProvider,
+    PlanToolProvider,
     RiskLevel,
     TaskToolProvider,
     ToolSearchProvider,
@@ -88,6 +89,8 @@ class Agent:
         self._turn_tool_names: set[str] = set()
         self._tool_selection_active = False
         self._recent_tool_names: list[str] = []
+        self._current_plan: list[dict[str, str]] = []
+        self._last_plan_explanation: str | None = None
         self._current_run_id: str | None = None
         self._activity_label: str | None = None
         self.tool_log_callback: Callable[[str, dict[str, Any] | None, str | None], Any] | None = None
@@ -112,6 +115,7 @@ class Agent:
                 self.update_memory,
                 self.delete_memory,
             )
+        plan_provider = PlanToolProvider(self.update_plan)
         selection_enabled = bool(
             self.config.get("tool_selection", "enabled", default=True)
         )
@@ -131,6 +135,7 @@ class Agent:
             self.config.get("mcp_servers", default={}) or {},
             workspace,
             task_provider=task_provider,
+            plan_provider=plan_provider,
             memory_provider=memory_provider,
             search_provider=search_provider,
         )
@@ -607,6 +612,23 @@ class Agent:
         self._trace_event("task_updated", {"task": task})
         return task
 
+    def update_plan(
+        self,
+        plan: list[dict[str, str]],
+        explanation: str = "",
+    ) -> dict[str, Any]:
+        self._current_plan = [dict(item) for item in plan]
+        self._last_plan_explanation = explanation.strip() or None
+        payload = {
+            "plan": self.get_plan(),
+            "explanation": self._last_plan_explanation,
+        }
+        self._trace_event("plan_updated", payload)
+        return payload
+
+    def get_plan(self) -> list[dict[str, str]]:
+        return [dict(item) for item in self._current_plan]
+
     def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
         if not self.store:
             raise RuntimeError("Conversation storage is disabled")
@@ -646,15 +668,16 @@ class Agent:
                 await self.close()
 
     async def _prepare_tool_selection(self, prompt: str) -> dict[str, Any]:
+        core_tools = self._core_tool_names()
         all_schemas = [
             schema
             for schema in self.tool_provider.schemas()
-            if schema.get("function", {}).get("name") != "tool_search"
+            if schema.get("function", {}).get("name") not in core_tools
         ]
         catalog = [
             item
             for item in self.tool_provider.catalog()
-            if item.get("name") != "tool_search"
+            if item.get("name") not in core_tools
         ]
         available = {str(item.get("name")) for item in catalog}
         schema_tokens = len(json.dumps(all_schemas, ensure_ascii=False)) // 4
@@ -827,6 +850,7 @@ class Agent:
 
     def _selected_tool_schemas(self) -> list[dict[str, Any]]:
         schemas = self.tool_provider.schemas()
+        core_tools = self._core_tool_names(include_search=False)
         if not self._tool_selection_active:
             return [
                 schema
@@ -835,21 +859,30 @@ class Agent:
             ]
         allowed = set(self._turn_tool_names)
         allowed.add("tool_search")
+        allowed.update(core_tools)
         return [
             schema
             for schema in schemas
             if schema.get("function", {}).get("name") in allowed
         ]
 
+    @staticmethod
+    def _core_tool_names(*, include_search: bool = True) -> set[str]:
+        names = {"update_plan"}
+        if include_search:
+            names.add("tool_search")
+        return names
+
     def _search_and_activate_tools(
         self,
         query: str,
         limit: int,
     ) -> list[dict[str, Any]]:
+        core_tools = self._core_tool_names()
         catalog = [
             item
             for item in self.tool_provider.catalog()
-            if item.get("name") != "tool_search"
+            if item.get("name") not in core_tools
         ]
         matches = rank_tool_catalog(query, catalog, limit=limit)
         for item in matches:
@@ -868,7 +901,7 @@ class Agent:
         ]
 
     def _remember_tool(self, tool_name: str) -> None:
-        if tool_name == "tool_search":
+        if tool_name in self._core_tool_names():
             return
         if tool_name in self._recent_tool_names:
             self._recent_tool_names.remove(tool_name)
@@ -952,6 +985,8 @@ class Agent:
         self._last_tool_selection = None
         self._turn_tool_names.clear()
         self._recent_tool_names.clear()
+        self._current_plan = []
+        self._last_plan_explanation = None
         self._session_approvals.clear()
         self._activity_label = None
         self.run_state = AgentRunState()
@@ -988,6 +1023,8 @@ class Agent:
         self._last_tool_selection = None
         self._turn_tool_names.clear()
         self._recent_tool_names.clear()
+        self._current_plan = []
+        self._last_plan_explanation = None
         self._session_approvals.clear()
         self._activity_label = None
         repaired = self._repair_incomplete_tool_transactions()
@@ -1316,6 +1353,8 @@ class Agent:
         self._cancel_event = asyncio.Event()
         self._active_task = asyncio.current_task()
         self._activity_label = None
+        self._current_plan = []
+        self._last_plan_explanation = None
         memory_entries = self._select_memory_entries(prompt, memory_entries)
         self._refresh_system_message(memory_entries, skills)
         self._ensure_session(prompt, memory_entries, skills)
@@ -1723,6 +1762,8 @@ class Agent:
             "workspace": str(self.config.get("security", "workspace_root", default=".")),
             "approval_mode": self.config.get("security", "approval_mode", default="auto"),
             "active_skills": list(self.active_skill_names),
+            "current_plan": self.get_plan(),
+            "last_plan_explanation": self._last_plan_explanation,
             "open_tasks": open_tasks,
             "project_memory_count": project_memory_count,
             "user_memory_count": user_memory_count,
