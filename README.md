@@ -1,6 +1,6 @@
 # Drudge
 
-Drudge 是一个轻量级终端 AI Agent 原型，目标是逐步演进成类似 Drudge / Codex 的本地开发助手。
+Drudge 是一个轻量级终端 AI Agent 原型，目标是逐步演进成类似 Codex 的本地开发助手。
 
 ## 当前能力
 
