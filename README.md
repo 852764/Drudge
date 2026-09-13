@@ -2,6 +2,8 @@
 
 Drudge 是一个 Python 3.10+ 终端编程 Agent，当前版本为 **0.2.0b1 Beta**，面向有人审阅的本地开发工作流。发布范围及已知边界见[发布说明](docs/RELEASE.md)。
 
+项目目标是逐步演进成类似 Codex 的本地开发助手。
+
 ## 当前能力
 
 - OpenAI-compatible Chat Completions 客户端
