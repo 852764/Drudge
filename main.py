@@ -5,6 +5,7 @@ import asyncio
 import argparse
 import json
 import os
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from config import ConfigManager, get_config
 from tools import ApprovalDecision, ApprovalRequest
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0b1"
 
 
 class ConsoleApproval:
@@ -257,6 +258,7 @@ def _configure_agent_extensions(
             f"{session['repaired_tool_calls']} repaired tool calls",
             level="success",
         )
+        _show_resumed_context(session, renderer)
     for name in skill_names or []:
         skill = agent.activate_skill(name)
         renderer.print_note(f"Activated skill: {skill.name} ({skill.description})", level="success")
@@ -436,7 +438,7 @@ def run_interactive(
     _attach_renderer(agent, renderer)
     try:
         _configure_agent_extensions(agent, resume_id, skill_names, renderer)
-    except (KeyError, RuntimeError) as exc:
+    except (KeyError, RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
         return
 
@@ -483,7 +485,7 @@ def _run_simple_interactive(
     _attach_renderer(agent, renderer)
     try:
         _configure_agent_extensions(agent, resume_id, skill_names, renderer)
-    except (KeyError, RuntimeError) as exc:
+    except (KeyError, RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
         print(str(exc), file=sys.stderr)
         return
 
@@ -570,28 +572,15 @@ async def _handle_command(cmd: str, config, agent: Agent | None = None, *, rende
         _show_tasks(agent, include_closed=len(parts) > 1 and parts[1].lower() == "all", renderer=renderer)
     elif command == "/task":
         _handle_task_command(parts[1:], agent)
+    elif command == "/plan":
+        _handle_plan_command(agent, parts[1:], renderer)
     elif command in ("/status", "/usage"):
         if agent is None:
             renderer.print_note("Agent is unavailable.", level="warning")
         else:
             await show_status(config, agent, renderer=renderer)
     elif command == "/compact":
-        if agent is None:
-            renderer.print_note("Agent is unavailable.", level="warning")
-        else:
-            result = await agent.compact_context()
-            renderer.print_note(
-                f"Context compacted: {result['before_messages']} -> {result['after_messages']} messages, "
-                f"~{result['before_tokens']} -> ~{result['after_tokens']} tokens "
-                f"(mode={result['mode']}, model={result.get('summary_model') or 'deterministic'}, "
-                f"summary_tokens={result['summary_tokens']})",
-                level="success",
-            )
-            if result.get("fallback_reason"):
-                renderer.print_note(
-                    f"LLM summary failed; used deterministic fallback: {result['fallback_reason']}",
-                    level="warning",
-                )
+        await _handle_compact_command(agent, renderer)
     elif command == "/resume":
         if agent is None:
             print("Agent is unavailable.")
@@ -607,12 +596,18 @@ async def _handle_command(cmd: str, config, agent: Agent | None = None, *, rende
                 )
                 if session["active_skills"]:
                     print(f"Active skills: {', '.join(session['active_skills'])}")
-            except (KeyError, RuntimeError) as exc:
+                _show_resumed_context(session, renderer)
+            except (KeyError, RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
                 print(str(exc))
+    elif command == "/fork":
+        _handle_fork_command(agent, " ".join(parts[1:]) or None, renderer)
     elif command == "/new":
-        if agent is not None:
-            agent.new_session()
-        print("Started a new session. Active skills were kept.")
+        try:
+            if agent is not None:
+                agent.new_session()
+            print("Started a new session. Active skills were kept.")
+        except RuntimeError as exc:
+            renderer.print_note(str(exc), level="warning")
     elif command == "/skills":
         _show_skills(agent, renderer=renderer)
     elif command == "/skill":
@@ -622,13 +617,132 @@ async def _handle_command(cmd: str, config, agent: Agent | None = None, *, rende
     elif command == "/changes":
         _show_file_revisions(agent, renderer=renderer)
     elif command == "/undo":
-        _handle_undo_command(agent, renderer=renderer)
+        _handle_undo_command(agent, parts[1:], renderer=renderer)
+    elif command in ("/outputs", "/output"):
+        _handle_output_command(agent, command, parts[1:], renderer)
     elif command == "/clear":
         import os
         os.system("cls" if os.name == "nt" else "clear")
     else:
         renderer.print_note(f"Unknown command: {command}. Type /help for available commands.", level="warning")
     return False
+
+
+def _display_output_text(text: str) -> str:
+    """Render terminal control characters literally; leave stored/model text intact."""
+    return "".join(
+        f"\\x{ord(char):02x}" if (ord(char) < 32 and char not in "\n\t") or 127 <= ord(char) < 160 else char
+        for char in text
+    )
+
+
+def _handle_plan_command(agent: Agent | None, arguments: list[str], renderer: CliRenderer) -> None:
+    if arguments:
+        renderer.print_note("Usage: /plan (read-only; ask the agent to update or clear its plan)", level="warning")
+        return
+    if agent is None:
+        renderer.print_note("Agent is unavailable.", level="warning")
+        return
+    try:
+        state = agent.get_plan_state()
+        lines = [f"Revision {state['revision']} | {'persistent' if state['persistent'] else 'in-memory'}"]
+        if state.get("explanation"):
+            lines.append(_display_output_text(state["explanation"]))
+        for index, item in enumerate(state["plan"], 1):
+            lines.append(_display_output_text(f"{index}. [{item['status']}] {item['step']}"))
+            if item.get("acceptance"):
+                lines.append("  Acceptance: " + _display_output_text(item["acceptance"]))
+            if item.get("evidence"):
+                lines.append("  Evidence (self-reported): " + _display_output_text(item["evidence"]))
+        if not state["plan"]:
+            lines.append("No current plan.")
+        renderer.print_panel("Session Plan", lines)
+    except (KeyError, ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+        renderer.print_note(_display_output_text(str(exc)), level="warning")
+
+
+def _handle_output_command(agent: Agent | None, command: str, arguments: list[str], renderer: CliRenderer) -> None:
+    if (command == "/outputs" and arguments) or (command == "/output" and not 1 <= len(arguments) <= 3):
+        renderer.print_note("Usage: /outputs | /output <id> [offset] [limit:1..1000]", level="warning")
+        return
+    if agent is None:
+        renderer.print_note("Agent is unavailable.", level="warning")
+        return
+    try:
+        if command == "/outputs":
+            outputs = agent.list_tool_outputs()
+            renderer.print_list("Captured Tool Outputs", [
+                f"{item['id']} | {_display_output_text(item['tool_name'])} | {item['size_bytes']} B | "
+                f"{'complete' if item['complete'] else 'partial'} ({item['status']})"
+                for item in outputs
+            ] or ["No captured outputs in the active session and workspace."])
+            return
+        offset = int(arguments[1]) if len(arguments) >= 2 else 0
+        limit = int(arguments[2]) if len(arguments) >= 3 else 1000
+        if offset < 0 or not 1 <= limit <= 1000:
+            raise ValueError("offset must be non-negative; limit must be between 1 and 1000")
+        page = agent.read_tool_output(arguments[0], offset=offset, limit=limit)
+        renderer.print_panel("Tool Output", [
+            f"{page['id']} | {page['offset']}..{page['next_offset']} / {page['char_count']} captured characters",
+            _display_output_text(page["content"]),
+        ])
+        if not page["complete"]:
+            renderer.print_note("Captured output is partial; EOF only marks the end of stored text.", level="warning")
+        if not page["eof"]:
+            renderer.print_note(f"Next: /output {page['id']} {page['next_offset']} {limit}")
+    except (KeyError, ValueError, RuntimeError, OSError, sqlite3.Error) as exc:
+        renderer.print_note(str(exc), level="warning")
+
+
+def _show_resumed_context(session: dict, renderer: CliRenderer) -> None:
+    if session.get("context_checkpoint_id"):
+        renderer.print_note(f"Context checkpoint: #{session['context_checkpoint_id']}")
+    if session.get("context_warning"):
+        renderer.print_note(session["context_warning"], level="warning")
+    repair = session.get("context_repair") or {}
+    if repair.get("dropped_results"):
+        renderer.print_note(
+            f"Excluded {repair['dropped_results']} orphan/duplicate tool outputs from working context; raw history is retained.",
+            level="warning",
+        )
+
+
+def _handle_fork_command(agent: Agent | None, title: str | None, renderer: CliRenderer) -> None:
+    if agent is None:
+        renderer.print_note("Agent is unavailable.", level="warning")
+        return
+    try:
+        session = agent.fork_session(title)
+        parent = session["metadata"]["parent_session_id"]
+        renderer.print_note(f"Forked {parent} -> {session['id']}: {session['title']}", level="success")
+        renderer.print_note("Conversation branch only; workspace files are shared. Approvals and undo history are not copied.")
+    except (KeyError, RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
+        renderer.print_note(str(exc), level="warning")
+
+
+async def _handle_compact_command(agent: Agent | None, renderer: CliRenderer) -> None:
+    if agent is None:
+        renderer.print_note("Agent is unavailable.", level="warning")
+        return
+    try:
+        result = await agent.compact_context()
+        renderer.print_note(
+            f"Context compacted: {result['before_messages']} -> {result['after_messages']} messages, "
+            f"~{result['before_tokens']} -> ~{result['after_tokens']} tokens "
+            f"(mode={result['mode']}, model={result.get('summary_model') or 'deterministic'}, "
+            f"summary_tokens={result['summary_tokens']})",
+            level="success",
+        )
+        if result.get("checkpoint_id"):
+            renderer.print_note(f"Saved context checkpoint #{result['checkpoint_id']}; full raw history retained.")
+        if result.get("fallback_reason"):
+            renderer.print_note(
+                f"LLM summary failed; used deterministic fallback: {result['fallback_reason']}", level="warning",
+            )
+    except asyncio.CancelledError:
+        renderer.print_note("Context compaction cancelled; ready for the next command.", level="warning")
+    except (RuntimeError, ValueError, OSError) as exc:
+        renderer.print_note(f"Context compaction stopped: {exc}", level="warning")
 
 
 def _show_skills(agent: Agent | None, *, renderer: CliRenderer | None = None) -> None:
@@ -899,15 +1013,30 @@ def _show_file_revisions(agent: Agent | None, *, renderer: CliRenderer | None = 
     )
 
 
-def _handle_undo_command(agent: Agent | None, *, renderer: CliRenderer | None = None) -> None:
+def _handle_undo_command(
+    agent: Agent | None, arguments: list[str] | None = None,
+    *, renderer: CliRenderer | None = None,
+) -> None:
     renderer = renderer or CliRenderer(pretty=False)
+    arguments = arguments or []
+    if arguments not in ([], ["--dry-run"]):
+        renderer.print_note("Usage: /undo [--dry-run]", level="warning")
+        return
     if agent is None:
         renderer.print_note("Agent is unavailable.", level="warning")
         return
     try:
-        revision = agent.undo_last_file_change()
-        renderer.print_note(f"Reverted change #{revision['id']} -> {revision['path']}", level="success")
-    except RuntimeError as exc:
+        dry_run = arguments == ["--dry-run"]
+        revision = agent.undo_last_file_change(dry_run=dry_run)
+        if dry_run:
+            renderer.print_panel("Undo Preview", [
+                f"#{revision['id']} {revision['undo_action']} {revision['path']}",
+                revision["undo_diff_summary"] or "(No textual line difference)",
+                "No files changed. Run /undo to apply; conflicts are checked again.",
+            ])
+        else:
+            renderer.print_note(f"Reverted change #{revision['id']} -> {revision['path']}", level="success")
+    except (RuntimeError, OSError, KeyError, ValueError) as exc:
         renderer.print_note(str(exc), level="warning")
 
 
@@ -1038,7 +1167,7 @@ def run_doctor(
     workspace = Path(security.get("workspace_root") or os.getcwd()).expanduser().resolve()
     print(f"Workspace: {workspace}")
     print(f"Workspace exists: {workspace.exists()}")
-    print(f"Approval mode: {security.get('approval_mode', 'auto')}")
+    print(f"Approval mode: {security.get('approval_mode', 'on_request')}")
     print(f"Terminal allowed: {security.get('allow_terminal', True)}")
     print(f"Network allowed: {security.get('allow_network', True)}")
 

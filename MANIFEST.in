@@ -1,0 +1,13 @@
+include AGENTS.md LICENSE README.md pyproject.toml
+include .github/workflows/ci.yml .gitignore .gitattributes
+recursive-include docs *.md
+recursive-include tests *.py
+recursive-include scripts *.py
+prune .git
+prune .drudge
+prune .codex
+prune .agents
+prune .venv
+prune build
+prune dist
+global-exclude __pycache__ *.py[cod] *.db *.db-shm *.db-wal auth.json .env .env.* config.local.yaml config.local.yml

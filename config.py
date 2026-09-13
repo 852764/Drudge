@@ -79,7 +79,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "allow_outside_workspace": False,
         "allow_terminal": True,
         "allow_network": True,
-        "approval_mode": os.getenv("DRUDGE_APPROVAL_MODE", "auto"),
+        "approval_mode": os.getenv("DRUDGE_APPROVAL_MODE", "on_request"),
     },
     "toolsets": ["terminal", "file", "web"],
 }

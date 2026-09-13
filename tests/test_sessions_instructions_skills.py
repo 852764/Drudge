@@ -22,6 +22,7 @@ def configured(workspace: str, db_path: str) -> ConfigManager:
     config.override("display", "show_tool_calls", value=False)
     config.override("agent", "refusal_review_enabled", value=False)
     config.override("security", "workspace_root", value=workspace)
+    config.override("security", "approval_mode", value="auto")
     config.override("toolsets", value=["file"])
     return config
 

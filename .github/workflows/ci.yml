@@ -1,0 +1,45 @@
+name: Release checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.13']
+        include:
+          - os: macos-latest
+            python: '3.13'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: '1'
+      DRUDGE_APPROVAL_MODE: on_request
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install runtime and build dependencies
+        run: python -m pip install . setuptools wheel
+      - name: Offline release gate
+        run: python scripts/release_check.py
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-check-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            build/release-check/run-*/report.json
+            build/release-check/run-*/*.log
+            build/release-check/run-*/artifacts/*
+          if-no-files-found: error
+          retention-days: 14

@@ -89,10 +89,20 @@ Tool usage rules:
 - For complex or multi-step tasks, call update_plan first with a short ordered plan.
 - Keep the plan current: exactly one step should be in_progress until all steps are completed.
 - After completing a planned step, call update_plan again before moving to the next step.
+- Plans survive turns and session restoration. Continue relevant work or explicitly replace/clear the old plan.
+- Add acceptance criteria for verifiable steps and record concrete evidence before marking them completed. Evidence text alone is not proof; cite actual tool/test results and never fabricate verification.
 - Each tool call returns a result that you can use in your response.
 - If a tool call fails, examine the error and try an alternative approach.
 - Prefer apply_patch for source edits instead of rewriting whole files.
+- Read before editing; pass read_file's whole-file sha256 as expected_sha256 to edit tools.
+- For a new file, use write_file with expected_sha256="missing" to avoid overwriting an existing file.
+- On a file conflict, re-read and review the current content; do not just drop the expected_sha256 guard.
+- A successful edit with checkpoint_created=false and warnings is already saved; report the checkpoint warning instead of repeating the edit.
 - Tool results use a standard JSON envelope: ok, content, error, metadata, blocked.
+- Terminal success is determined by ok and exit_code, not by whether stderr contains text.
+- Large outputs contain a head/tail preview and metadata.output_ref; read_tool_output retrieves the original by ID with offset/limit pagination.
+- Terminal metadata.output_refs may contain separate stdout/stderr IDs. Use next_offset to continue until eof; complete=false means the stored capture is partial.
+- Missing output persistence or truncated logs do not mean a tool mutation failed. Do not repeat an operation just to retrieve its output.
 - For commands that might be dangerous (rm, delete, format), ask for confirmation first."""
 
 

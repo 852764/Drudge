@@ -1,6 +1,6 @@
 # Drudge
 
-Drudge 是一个轻量级终端 AI Agent 原型，目标是逐步演进成类似 Drudge / Codex 的本地开发助手。
+Drudge 是一个 Python 3.10+ 终端编程 Agent，当前版本为 **0.2.0b1 Beta**，面向有人审阅的本地开发工作流。发布范围及已知边界见[发布说明](docs/RELEASE.md)。
 
 ## 当前能力
 
@@ -10,6 +10,11 @@ Drudge 是一个轻量级终端 AI Agent 原型，目标是逐步演进成类似
 - 单次查询与交互式 CLI
 - YAML 配置文件与环境变量配置
 - 不可变工具权限上下文和显式 Agent 运行状态
+- SHA-256 编辑前置校验、原子文件写入、冲突检测撤销与 `/undo --dry-run` 预览
+- 持久化压缩上下文、中断工具事务恢复，以及 `/fork` 会话分支
+- 准确的终端退出状态、有界大输出捕获，以及 `/outputs` / `/output` 持久化分页
+- 可恢复的计划、验收记录、并发修订冲突检测和 `/plan`
+- 默认交互审批、Windows Job Object 后代进程清理及离线发布检查
 
 ## 安装
 
@@ -53,6 +58,8 @@ agent:
 
 ## 使用
 
+默认 `on_request` 会在修改文件或执行终端命令前询问；非交互运行不会自动批准。仅在信任任务和执行环境时显式使用 `--approval-mode auto`。审批不是操作系统沙箱。
+
 ```bash
 drudge --version
 drudge --help
@@ -75,6 +82,9 @@ python main.py --help
 
 ```bash
 python -m unittest discover -s tests -v
+python -m compileall -q agent config.py main.py prompt tools tests
+# 完整离线发布门槛（另需 setuptools、wheel）：
+python scripts/release_check.py
 ```
 
 ## 开发文档
@@ -92,3 +102,8 @@ python -m unittest discover -s tests -v
 - [AgentRuntime 生命周期](docs/AGENT_RUNTIME.md)
 - [动态工具选择](docs/TOOL_SELECTION.md)
 - [模型请求重试与错误恢复](docs/LLM_RETRY_RECOVERY.md)
+- [可靠文件编辑与撤销预览](docs/RELIABLE_FILE_EDITS.md)
+- [长任务上下文恢复与会话分支](docs/DURABLE_CONTEXT.md)
+- [工具状态与大输出分页](docs/TOOL_OUTPUTS.md)
+- [持久化计划与验收记录](docs/PERSISTENT_PLANS.md)
+- [Beta 发布门槛与运维说明](docs/RELEASE.md)

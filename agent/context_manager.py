@@ -73,6 +73,8 @@ def partition_messages_for_compaction(
     keep_recent: int = 8,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Split messages while keeping recent tool-call transactions intact."""
+    if keep_recent < 1:
+        raise ValueError("compact_keep_recent must be at least 1")
     system_messages = [msg for msg in messages if msg.get("role") == "system"]
     later_messages = [msg for msg in messages if msg.get("role") != "system"]
     if len(later_messages) <= keep_recent:
@@ -133,23 +135,39 @@ def compact_messages(messages: list[dict[str, Any]], *, keep_recent: int = 8) ->
 
 
 def summarize_messages(messages: list[dict[str, Any]], *, max_items: int = 20) -> str:
+    if max_items < 1:
+        return "No prior messages retained."
     items: list[str] = []
     for msg in messages:
         role = msg.get("role")
         content = str(msg.get("content") or "").replace("\n", " ").strip()
         if role == "user" and content:
             items.append(f"User: {_clip(content, 240)}")
-        elif role == "assistant" and content:
+        elif role == "assistant" and (content or msg.get("tool_calls")):
             tool_count = len(msg.get("tool_calls") or [])
-            suffix = f"; requested {tool_count} tool call(s)" if tool_count else ""
+            call_names = [str((call.get("function") or {}).get("name") or "unknown") for call in msg.get("tool_calls") or []]
+            suffix = f"; requested {tool_count} tool call(s): {', '.join(call_names)}" if tool_count else ""
             items.append(f"Assistant: {_clip(content, 240)}{suffix}")
         elif role == "tool":
-            if "error" in content.lower():
+            try:
+                payload = json.loads(str(msg.get("content") or ""))
+            except (TypeError, ValueError):
+                payload = None
+            is_error = (
+                payload.get("ok") is False or bool(payload.get("error")) or bool(payload.get("blocked"))
+            ) if isinstance(payload, dict) else "error" in content.lower()
+            if is_error:
                 items.append(f"Tool error: {_clip(content, 200)}")
             else:
                 items.append(f"Tool result: {_clip(content, 200)}")
-        if len(items) >= max_items:
-            break
+    if len(items) > max_items:
+        # Retain the initial requirement plus the newest evidence/corrections,
+        # rather than silently discarding everything after the first 20 items.
+        first_requirement = next((item for item in items if item.startswith("User:")), None)
+        recent = items[-max_items:]
+        if max_items > 1 and first_requirement and first_requirement not in recent:
+            recent = [first_requirement] + recent[-(max_items - 1):]
+        items = recent
     return "\n".join(items) or "No prior messages retained."
 
 

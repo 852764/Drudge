@@ -12,6 +12,10 @@ from config import ConfigManager
 
 
 class ConfigTests(unittest.TestCase):
+    def test_default_approval_requires_host_confirmation(self):
+        config = ConfigManager()
+        self.assertEqual(config.get("security", "approval_mode"), os.getenv("DRUDGE_APPROVAL_MODE", "on_request"))
+
     def test_default_model_uses_local_custom_responses_provider(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "ignored-openai-key"}):
             config = ConfigManager()

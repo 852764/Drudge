@@ -42,7 +42,9 @@ python main.py --codex-oauth --resume <session_id>
 - 会话启用的 Skills；
 - 累计 Agent turn。
 
-如果程序在工具调用完成前退出，恢复时会补入一个 `interrupted` tool result，保证 Chat Completions 和 Responses 的工具事务仍然完整。恢复使用当前工作区、当前模型配置以及最新的 `AGENTS.md`/Skill 内容。
+如果程序在工具结果记录前退出，恢复时会在相应工具事务的位置补入 `interrupted` / `outcome_unknown` 结果，保证 Chat Completions 和 Responses 的消息顺序完整；恢复不自动重跑工具。恢复使用当前工作区、当前模型配置以及最新的 `AGENTS.md`/Skill 内容。
+
+压缩后的工作上下文现在也持久化，原始历史保留。可使用 `/fork [title]` 创建会话分支；文件仍共享，审批与撤销历史不复制。详见[长任务上下文恢复与会话分支](DURABLE_CONTEXT.md)。
 
 ## 3. AGENTS.md
 

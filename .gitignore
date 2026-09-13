@@ -21,6 +21,7 @@ build/
 *.egg-info/
 
 .drudge/
+.codex/
 .drudge-live/
 *.db
 *.db-shm

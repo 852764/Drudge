@@ -10,6 +10,28 @@ from tools import ToolContext, registry
 
 
 class ToolSecurityTests(unittest.TestCase):
+    def test_default_context_blocks_unapproved_mutation(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            for context in (
+                ToolContext(Path(workspace).resolve(), frozenset({"file", "terminal"})),
+                ToolContext.from_config({"workspace_root": workspace}, ["file", "terminal"]),
+            ):
+                for name, args in (
+                    ("write_file", {"path": "blocked.txt", "content": "no"}),
+                    ("terminal", {"command": "echo not-approved"}),
+                ):
+                    payload = json.loads(asyncio.run(registry.dispatch_async(name, args, context=context)))
+                    self.assertFalse(payload["ok"])
+                    self.assertTrue(payload["metadata"]["approval_required"])
+            self.assertFalse(Path(workspace, "blocked.txt").exists())
+
+    def test_invalid_approval_modes_fail_closed(self):
+        for mode in ("", "automatic", "AUTO", None, True, []):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                ToolContext(Path.cwd(), frozenset({"terminal"}), approval_mode=mode)
+            with self.assertRaises(ValueError):
+                ToolContext.from_config({"approval_mode": mode}, ["terminal"])
+
     def test_schema_rejects_additional_properties(self):
         schema = next(
             item for item in registry.get_schemas(["file"])
@@ -65,6 +87,7 @@ class ToolSecurityTests(unittest.TestCase):
                 Path(workspace).resolve(),
                 frozenset({"terminal"}),
                 allow_terminal=False,
+                approval_mode="auto",
             )
             result = asyncio.run(registry.dispatch_async(
                 "terminal",
@@ -79,7 +102,7 @@ class ToolSecurityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as workspace:
             target = Path(workspace, "sample.txt")
             target.write_text("hello old", encoding="utf-8")
-            context = ToolContext(Path(workspace).resolve(), frozenset({"file"}))
+            context = ToolContext(Path(workspace).resolve(), frozenset({"file"}), approval_mode="auto")
 
             result = asyncio.run(registry.dispatch_async(
                 "apply_patch",

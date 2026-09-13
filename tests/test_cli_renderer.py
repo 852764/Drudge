@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import unittest
+from unittest.mock import patch
 
 from agent.cli_renderer import CliRenderer
 
@@ -144,7 +146,8 @@ class CliRendererTests(unittest.TestCase):
         self.assertIn("result:", output)
         self.assertTrue(output.startswith("+- Tool Log"))
 
-    def test_code_block_uses_ansi_highlighting_when_color_enabled(self):
+    @patch.object(CliRenderer, "_enable_color_support", return_value=True)
+    def test_code_block_uses_ansi_highlighting_when_color_enabled(self, _color_support):
         stream = _TTYBuffer()
         renderer = CliRenderer(stream=stream, pretty=True, color=True, width=72, is_tty=True)
 
@@ -153,6 +156,14 @@ class CliRendererTests(unittest.TestCase):
         output = stream.getvalue()
         self.assertIn("\x1b[95;1mdef\x1b[0m", output)
         self.assertIn("\x1b[95;1mreturn\x1b[0m 42", output)
+
+    def test_no_color_environment_disables_ansi(self):
+        stream = _TTYBuffer()
+        with patch.dict(os.environ, {"NO_COLOR": "1"}):
+            renderer = CliRenderer(stream=stream, pretty=True, color=True, is_tty=True)
+        renderer.print_assistant_message("```python\ndef answer():\n    return 42\n```")
+        self.assertFalse(renderer.color)
+        self.assertNotIn("\x1b[", stream.getvalue())
 
 
 if __name__ == "__main__":

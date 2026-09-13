@@ -8,6 +8,7 @@ from agent.context_manager import (
     build_context_summary_messages,
     build_repo_map,
     compact_messages,
+    partition_messages_for_compaction,
     summarize_messages,
 )
 
@@ -90,6 +91,31 @@ class ContextManagerTests(unittest.TestCase):
         self.assertIn("tool_call_id", transcript)
         self.assertNotIn("provider_items", transcript)
         self.assertNotIn("encrypted_content", transcript)
+
+    def test_fallback_keeps_original_requirement_and_latest_correction(self):
+        messages = [{"role": "user", "content": "initial constraint"}] + [
+            {"role": "assistant", "content": f"step {index}"} for index in range(30)
+        ] + [{"role": "user", "content": "latest correction"}]
+        summary = summarize_messages(messages, max_items=4)
+        self.assertIn("initial constraint", summary)
+        self.assertIn("latest correction", summary)
+        self.assertIn("step 29", summary)
+        self.assertNotIn("step 0", summary)
+        self.assertEqual(len(summary.splitlines()), 4)
+
+    def test_fallback_distinguishes_success_envelope_from_tool_error(self):
+        summary = summarize_messages([
+            {"role": "tool", "content": '{"ok":true,"error":null,"content":"success"}'},
+            {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file"}}]},
+        ])
+        self.assertIn("Tool result:", summary)
+        self.assertNotIn("Tool error:", summary)
+        self.assertIn("read_file", summary)
+
+    def test_compaction_rejects_non_positive_recent_window(self):
+        for count in (0, -1):
+            with self.assertRaisesRegex(ValueError, "at least 1"):
+                partition_messages_for_compaction([{"role": "user", "content": "latest"}], keep_recent=count)
 
 
 if __name__ == "__main__":

@@ -7,14 +7,16 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable
 
 from .context import ToolContext
 from .registry import ToolRegistry
-from .result import ToolResult
+from .result import ToolResult, normalize_tool_result
 from .risk import RiskLevel, ToolRisk, coerce_risk_level
+from .plan import MAX_PLAN_STEPS, PLAN_FIELD_LIMITS, normalize_plan
 
 
 class ToolProvider(ABC):
@@ -194,7 +196,7 @@ class TaskToolProvider(ToolProvider):
 
 
 class PlanToolProvider(ToolProvider):
-    """Agent-owned runtime plan tool."""
+    """Agent-owned session plan tool; scope and revision are host-controlled."""
 
     name = "plan"
     _statuses = {"pending", "in_progress", "completed"}
@@ -209,14 +211,16 @@ class PlanToolProvider(ToolProvider):
             "function": {
                 "name": "update_plan",
                 "description": (
-                    "Replace the current runtime plan for complex work. Use it to list "
-                    "ordered steps and update their status as work progresses."
+                    "Replace the session plan for complex work. Plans survive turns and, when storage is enabled, restarts. "
+                    "Record acceptance criteria and concrete evidence; evidence text is not automatically verified. "
+                    "An empty array explicitly clears the plan."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "plan": {
                             "type": "array",
+                            "maxItems": MAX_PLAN_STEPS,
                             "description": "Ordered plan items.",
                             "items": {
                                 "type": "object",
@@ -224,11 +228,20 @@ class PlanToolProvider(ToolProvider):
                                     "step": {
                                         "type": "string",
                                         "description": "Short concrete step.",
+                                        "maxLength": PLAN_FIELD_LIMITS["step"],
                                     },
                                     "status": {
                                         "type": "string",
                                         "description": "Current step status.",
                                         "enum": ["pending", "in_progress", "completed"],
+                                    },
+                                    "acceptance": {
+                                        "type": "string", "maxLength": PLAN_FIELD_LIMITS["acceptance"],
+                                        "description": "Optional observable acceptance criteria.",
+                                    },
+                                    "evidence": {
+                                        "type": "string", "maxLength": PLAN_FIELD_LIMITS["evidence"],
+                                        "description": "Concrete results, commands, or output IDs; required when completing a step with acceptance criteria.",
                                     },
                                 },
                                 "required": ["step", "status"],
@@ -238,6 +251,7 @@ class PlanToolProvider(ToolProvider):
                         "explanation": {
                             "type": "string",
                             "description": "Optional short reason for this plan update.",
+                            "maxLength": 2000,
                         },
                     },
                     "required": ["plan"],
@@ -265,7 +279,7 @@ class PlanToolProvider(ToolProvider):
         return tool_name == "update_plan"
 
     def assess_risk(self, tool_name: str, args: dict, context: ToolContext) -> ToolRisk:
-        return ToolRisk(RiskLevel.LOW, "Agent-local runtime plan metadata", tool_name)
+        return ToolRisk(RiskLevel.LOW, "Agent-local session plan metadata", tool_name)
 
     async def call(
         self,
@@ -278,29 +292,12 @@ class PlanToolProvider(ToolProvider):
         try:
             if tool_name != "update_plan":
                 return ToolResult.failure(f"Unknown plan tool: {tool_name}").to_json()
-            raw_plan = args.get("plan")
-            if not isinstance(raw_plan, list):
-                raise ValueError("plan must be an array")
-            plan: list[dict[str, str]] = []
-            for index, item in enumerate(raw_plan, 1):
-                if not isinstance(item, dict):
-                    raise ValueError(f"plan item {index} must be an object")
-                step = str(item.get("step") or "").strip()
-                status = str(item.get("status") or "").strip()
-                if not step:
-                    raise ValueError(f"plan item {index} step cannot be empty")
-                if status not in self._statuses:
-                    raise ValueError(f"plan item {index} has invalid status: {status}")
-                plan.append({"step": step, "status": status})
-            in_progress = sum(1 for item in plan if item["status"] == "in_progress")
-            completed = all(item["status"] == "completed" for item in plan) if plan else True
-            if in_progress > 1:
-                raise ValueError("at most one plan item can be in_progress")
-            if plan and not completed and in_progress != 1:
-                raise ValueError("exactly one plan item must be in_progress until all are completed")
-            value = self._update(plan, str(args.get("explanation") or ""))
+            if not isinstance(args, dict) or set(args) - {"plan", "explanation"}:
+                raise ValueError("Unsupported plan arguments; session, workspace and revision are host-controlled")
+            payload = normalize_plan(args.get("plan"), args.get("explanation", ""))
+            value = self._update(payload["plan"], payload["explanation"] or "")
             return ToolResult.success(json.dumps(value, ensure_ascii=False)).to_json()
-        except (TypeError, ValueError, RuntimeError) as exc:
+        except (TypeError, ValueError, RuntimeError, KeyError, OSError, sqlite3.Error) as exc:
             return ToolResult.failure(str(exc)).to_json()
 
 
@@ -503,6 +500,47 @@ class ToolSearchProvider(ToolProvider):
                 activated=[item["name"] for item in matches],
             ).to_json()
         except (TypeError, ValueError, RuntimeError) as exc:
+            return ToolResult.failure(str(exc)).to_json()
+
+
+class OutputToolProvider(ToolProvider):
+    """Read-only output access through immutable host-bound callbacks."""
+
+    name = "tool_output"
+
+    def schemas(self) -> list[dict[str, Any]]:
+        return [_function_schema(
+            "read_tool_output", "Read a persisted tool-output page by ID from the active session. Offsets are Unicode characters.",
+            {
+                "output_id": {"type": "string", "description": "Output ID from output_ref or stream output_refs"},
+                "offset": {"type": "integer", "description": "Zero-based character offset (default 0)"},
+                "limit": {"type": "integer", "description": "Characters to read, 1..1000 (default 1000)"},
+            }, ["output_id"],
+        )]
+
+    def tool_names(self) -> list[str]:
+        return ["read_tool_output"]
+
+    def owns(self, tool_name: str) -> bool:
+        return tool_name == "read_tool_output"
+
+    def assess_risk(self, tool_name: str, args: dict, context: ToolContext) -> ToolRisk:
+        return ToolRisk(RiskLevel.LOW, "Read a captured output in the active session", tool_name)
+
+    def catalog(self) -> list[dict[str, Any]]:
+        return [{"name": "read_tool_output", "description": self.schemas()[0]["function"]["description"], "category": "core", "provider": self.name, "risk": "low"}]
+
+    async def call(self, tool_name: str, args: dict, context: ToolContext, *, approved: bool = False) -> str:
+        if not self.owns(tool_name) or context is None or context.read_tool_output is None:
+            return ToolResult.failure("Tool output storage is unavailable", blocked=True).to_json()
+        if not isinstance(args, dict) or set(args) - {"output_id", "offset", "limit"}:
+            return ToolResult.failure("Unknown tool output arguments", blocked=True).to_json()
+        try:
+            if not isinstance(args.get("output_id"), str):
+                raise ValueError("output_id is required and must be a string")
+            result = context.read_tool_output(**args)
+            return normalize_tool_result(result)
+        except (ValueError, KeyError, RuntimeError, OSError, sqlite3.Error) as exc:
             return ToolResult.failure(str(exc)).to_json()
 
 
@@ -951,6 +989,7 @@ def create_tool_provider(
     plan_provider: ToolProvider | None = None,
     memory_provider: ToolProvider | None = None,
     search_provider: ToolProvider | None = None,
+    output_provider: ToolProvider | None = None,
 ) -> CompositeToolProvider:
     providers: list[ToolProvider] = [LocalToolProvider(registry, toolsets)]
     if task_provider is not None:
@@ -961,6 +1000,8 @@ def create_tool_provider(
         providers.append(memory_provider)
     if search_provider is not None:
         providers.append(search_provider)
+    if output_provider is not None:
+        providers.append(output_provider)
     for name, server_config in (mcp_servers or {}).items():
         if not isinstance(server_config, dict) or not server_config.get("enabled", True):
             continue

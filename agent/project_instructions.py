@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from tools.context import is_sensitive_path
+
 
 @dataclass(frozen=True, slots=True)
 class ProjectInstruction:
@@ -40,13 +42,18 @@ def load_project_instructions(
     remaining = max(0, int(max_chars))
     for directory in directories:
         candidate = directory / filename
+        if is_sensitive_path(candidate):
+            continue
         if not candidate.is_file() or remaining <= 0:
             continue
         resolved = candidate.resolve()
+        if is_sensitive_path(resolved):
+            continue
         if resolved != root and root not in resolved.parents:
             continue
         try:
-            content = resolved.read_text(encoding="utf-8")
+            with resolved.open(encoding="utf-8") as stream:
+                content = stream.read(remaining)
         except (OSError, UnicodeDecodeError):
             continue
         content = content[:remaining].strip()

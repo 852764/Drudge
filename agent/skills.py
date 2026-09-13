@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from tools.context import is_sensitive_path
+
 
 _SKILL_NAME = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
@@ -93,7 +95,10 @@ class SkillManager:
         return list(skill.scripts.get(phase, []))
 
     def _load_file(self, path: Path) -> Skill:
-        raw = path.read_text(encoding="utf-8")[: self.max_chars]
+        if is_sensitive_path(path) or is_sensitive_path(path.resolve()):
+            raise ValueError("Credential files are excluded from skill context")
+        with path.open(encoding="utf-8") as stream:
+            raw = stream.read(self.max_chars)
         metadata: dict[str, Any] = {}
         instructions = raw.strip()
         if raw.startswith("---"):
@@ -130,13 +135,17 @@ class SkillManager:
             rel = str(item).strip()
             if not rel:
                 continue
-            candidate = (root / rel).resolve()
+            source = root / rel
+            candidate = source.resolve()
+            if is_sensitive_path(source) or is_sensitive_path(candidate):
+                continue
             if root.resolve() not in candidate.parents and candidate != root.resolve():
                 continue
             if not candidate.is_file():
                 continue
             try:
-                content = candidate.read_text(encoding="utf-8")[:remaining]
+                with candidate.open(encoding="utf-8") as stream:
+                    content = stream.read(remaining)
             except (OSError, UnicodeDecodeError):
                 continue
             if not content:

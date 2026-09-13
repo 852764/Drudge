@@ -15,6 +15,11 @@ class ApprovalMode(str, Enum):
     NEVER = "never"
 
 
+def is_sensitive_path(path: Path) -> bool:
+    parts = {part.lower() for part in path.parts}
+    return path.name.lower() == "auth.json" and bool({".drudge", ".codex"} & parts)
+
+
 @dataclass(frozen=True, slots=True)
 class ToolContext:
     workspace: Path
@@ -22,10 +27,17 @@ class ToolContext:
     allow_outside_workspace: bool = False
     allow_terminal: bool = True
     allow_network: bool = True
-    approval_mode: str = ApprovalMode.AUTO.value
+    approval_mode: str = ApprovalMode.ON_REQUEST.value
     session_id: str | None = None
     run_id: str | None = None
     record_file_change: Callable[[dict[str, Any]], None] | None = None
+    save_tool_output: Callable[..., dict[str, Any]] | None = None
+    read_tool_output: Callable[..., dict[str, Any]] | None = None
+    max_output_bytes: int = 8 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if self.approval_mode not in tuple(mode.value for mode in ApprovalMode):
+            raise ValueError("approval_mode must be auto, on_request, or never")
 
     @classmethod
     def from_config(
@@ -36,6 +48,8 @@ class ToolContext:
         session_id: str | None = None,
         run_id: str | None = None,
         record_file_change: Callable[[dict[str, Any]], None] | None = None,
+        save_tool_output: Callable[..., dict[str, Any]] | None = None,
+        read_tool_output: Callable[..., dict[str, Any]] | None = None,
     ) -> "ToolContext":
         workspace = Path(security.get("workspace_root") or os.getcwd()).expanduser().resolve()
         return cls(
@@ -44,10 +58,12 @@ class ToolContext:
             allow_outside_workspace=bool(security.get("allow_outside_workspace", False)),
             allow_terminal=bool(security.get("allow_terminal", True)),
             allow_network=bool(security.get("allow_network", True)),
-            approval_mode=str(security.get("approval_mode", ApprovalMode.AUTO.value)),
+            approval_mode=str(security.get("approval_mode", ApprovalMode.ON_REQUEST.value)),
             session_id=session_id,
             run_id=run_id,
             record_file_change=record_file_change,
+            save_tool_output=save_tool_output,
+            read_tool_output=read_tool_output,
         )
 
     def allows_toolset(self, toolset: str) -> bool:
@@ -57,7 +73,11 @@ class ToolContext:
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
+        if is_sensitive_path(candidate):
+            raise PermissionError("Access to credential files is blocked")
         resolved = candidate.resolve()
+        if is_sensitive_path(resolved):
+            raise PermissionError("Access to credential files is blocked")
         if not self.allow_outside_workspace:
             if resolved != self.workspace and self.workspace not in resolved.parents:
                 raise PermissionError(f"Path outside workspace is blocked: {resolved}")

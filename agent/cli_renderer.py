@@ -180,6 +180,7 @@ class CliRenderer:
                 ),
                 ("Turns", local["turns"]),
                 ("Messages", local["message_count"]),
+                ("Context checkpoint", local.get("context_checkpoint_id") or "(none)"),
                 (
                     "Tokens",
                     f"{local['tokens_this_process']} (utility: {local['utility_tokens_this_process']})",
@@ -205,6 +206,8 @@ class CliRenderer:
                 accent=self.theme.heading,
             )
         selection = local.get("last_tool_selection")
+        if local.get("context_warning"):
+            self.print_note(local["context_warning"], level="warning")
         if selection:
             self.print_panel(
                 "Tool Selection",
@@ -246,14 +249,18 @@ class CliRenderer:
                 "/runs               List recent runs",
                 "/trace [run_id]     Show a persisted run trace",
                 "/tasks [all]        List persistent session tasks",
+                "/plan               Show session plan, acceptance criteria and evidence",
                 "/task add <title>   Create a persistent task",
                 "/task start|done|cancel|reopen <id>",
                 "/memory [...]       Manage durable project/user memories",
                 "/changes            List reversible file changes",
-                "/undo               Revert the latest file change",
+                "/undo [--dry-run]   Revert or preview the latest file change (conflict-checked)",
+                "/outputs            List captured tool outputs in this session",
+                "/output <id> [offset] [limit]  Read an output page (up to 1000 characters)",
                 "/status             Show session, context, and account limits",
                 "/compact            Compact older conversation context",
                 "/resume <id>        Resume a saved session",
+                "/fork [title]       Branch current conversation (workspace files stay shared)",
                 "/new                Start a new session",
                 "/skills             List discovered skills",
                 "/skill <name>       Activate a skill",

@@ -197,7 +197,7 @@ class ApprovalAndStreamingTests(unittest.TestCase):
 
     def test_terminal_subprocess_is_cancelled(self):
         with tempfile.TemporaryDirectory() as workspace:
-            context = ToolContext(Path(workspace).resolve(), frozenset({"terminal"}))
+            context = ToolContext(Path(workspace).resolve(), frozenset({"terminal"}), approval_mode="auto")
             if sys.platform == "win32":
                 command = "for /L %i in (1,1,2147483647) do @ver > nul"
             else:

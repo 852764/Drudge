@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import locale
 import os
 import signal
 import subprocess
+import sys
+from pathlib import Path
 
 from .context import ToolContext
+from .output_capture import OutputCapture
 from .registry import registry
 from .result import ToolResult
 from .risk import RiskLevel, ToolRisk
@@ -59,30 +63,15 @@ def _terminal_risk(args: dict, context: ToolContext) -> ToolRisk:
 
 
 async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
-        return
     if os.name == "nt":
-        try:
-            killer = await asyncio.create_subprocess_exec(
-                "taskkill",
-                "/PID",
-                str(process.pid),
-                "/T",
-                "/F",
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await asyncio.wait_for(killer.wait(), timeout=3)
-            if killer.returncode != 0 and process.returncode is None:
+        # This PID is the isolated owner, not the shell. Killing it closes its
+        # Job Object handle and terminates descendants even if the shell exited.
+        if process.returncode is None:
+            try:
                 process.kill()
-        except (FileNotFoundError, asyncio.TimeoutError):
-            if process.returncode is None:
-                process.kill()
-        try:
-            await asyncio.wait_for(process.communicate(), timeout=3)
-        except asyncio.TimeoutError:
-            if process.returncode is None:
-                process.kill()
+            except ProcessLookupError:
+                pass
+        await asyncio.wait_for(process.wait(), timeout=3)
         return
     else:
         try:
@@ -91,12 +80,14 @@ async def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:
             return
         try:
             await asyncio.wait_for(process.wait(), timeout=2)
-            return
         except asyncio.TimeoutError:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                return
+            pass
+        # The shell can exit before its descendants close inherited pipes.
+        # Finish terminating the process group even if its leader has exited.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     await asyncio.wait_for(process.wait(), timeout=3)
 
 
@@ -112,6 +103,8 @@ async def terminal_handler(
     allowed, reason = context.terminal_allowed(command)
     if not allowed:
         return ToolResult.failure(reason or "Terminal command blocked", blocked=True)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        return ToolResult.failure("timeout must be a positive integer")
 
     cwd = context.resolve_path(workdir or ".")
     if os.name == "nt":
@@ -120,50 +113,117 @@ async def terminal_handler(
         shell_cmd = ["bash", "-c", command]
         creationflags = 0
 
-    try:
-        if os.name == "nt":
-            process = await asyncio.create_subprocess_shell(
-                command,
-                executable=os.environ.get("COMSPEC", "cmd.exe"),
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=creationflags,
-            )
-        else:
-            process = await asyncio.create_subprocess_exec(
-                *shell_cmd,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                creationflags=creationflags,
-                start_new_session=True,
-            )
-    except FileNotFoundError:
-        return ToolResult.failure(
-            "Shell not found. On Windows, ensure cmd.exe is available.",
-            exit_code=-1,
-        )
-
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        await asyncio.shield(_terminate_process_tree(process))
-        return ToolResult.failure(f"Command timed out after {timeout}s", exit_code=-1)
-    except asyncio.CancelledError:
-        await asyncio.shield(_terminate_process_tree(process))
-        raise
-
     encoding = locale.getpreferredencoding(False) if os.name == "nt" else "utf-8"
-    out = stdout.decode(encoding, errors="replace")
-    err = stderr.decode(encoding, errors="replace")
-    output = out
-    if err:
-        output += "\n[STDERR]\n" + err
-    return json.dumps({
-        "output": output.strip() or "(no output)",
-        "exit_code": process.returncode,
-    }, ensure_ascii=False)
+    captures: dict[str, OutputCapture] = {}
+    try:
+        for name in ("stdout", "stderr"):
+            captures[name] = OutputCapture(persist=context.save_tool_output is not None, max_bytes=context.max_output_bytes)
+        try:
+            if os.name == "nt":
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable, "-I", "-u", str(Path(__file__).with_name("_windows_job.py")), command, cwd=str(cwd),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, creationflags=creationflags,
+                )
+            else:
+                process = await asyncio.create_subprocess_exec(
+                    *shell_cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE, creationflags=creationflags, start_new_session=True,
+                )
+        except OSError as exc:
+            return ToolResult.failure(f"Command launch failed: {type(exc).__name__}: {exc}", exit_code=-1)
+
+        async def drain(stream, capture):
+            decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+            while True:
+                data = await stream.read(16_384)
+                if not data:
+                    break
+                capture.write(decoder.decode(data))
+            capture.write(decoder.decode(b"", final=True))
+
+        readers = [asyncio.create_task(drain(process.stdout, captures["stdout"])), asyncio.create_task(drain(process.stderr, captures["stderr"]))]
+
+        async def monitor():
+            await asyncio.gather(process.wait(), *readers)
+
+        monitor_task = asyncio.create_task(monitor())
+
+        cleanup_warnings = []
+
+        async def stop():
+            try:
+                await _terminate_process_tree(process)
+                await asyncio.wait_for(asyncio.shield(monitor_task), timeout=2)
+            except Exception as exc:
+                cleanup_warnings.append(f"Process cleanup incomplete (pid={process.pid}): {type(exc).__name__}: {exc}")
+            finally:
+                for task in [monitor_task, *readers]:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(monitor_task, *readers, return_exceptions=True)
+
+        async def stop_until_done() -> bool:
+            # Retain and await the cleanup task: a second Ctrl-C must not let it
+            # outlive the captures or the event loop. Preserve cancellation.
+            cleanup = asyncio.create_task(stop())
+            cancelled = False
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    cancelled = True
+            cleanup.result()
+            return cancelled
+
+        status = "completed"
+        error = None
+        try:
+            await asyncio.wait_for(asyncio.shield(monitor_task), timeout=timeout)
+        except asyncio.TimeoutError:
+            status = "timed_out"
+            error = f"Command timed out after {timeout}s"
+            if await stop_until_done():
+                status = "cancelled"
+        except asyncio.CancelledError:
+            status = "cancelled"
+            await stop_until_done()
+        except Exception as exc:
+            status = "capture_error"
+            error = f"Command output capture failed: {type(exc).__name__}: {exc}"
+            if await stop_until_done():
+                status = "cancelled"
+
+        refs = {}
+        warnings = list(cleanup_warnings)
+        for name, capture in captures.items():
+            ref = capture.finish(context.save_tool_output, tool_name=f"terminal.{name}", status=status)
+            if ref:
+                refs[name] = ref
+            if capture.warning:
+                warnings.append(capture.warning)
+        if status == "cancelled":
+            raise asyncio.CancelledError("; ".join(cleanup_warnings) or "Command cancelled")
+        out = captures["stdout"].preview()
+        err = captures["stderr"].preview()
+        output = out + ("\n[STDERR]\n" + err if err else "")
+        exit_code = process.returncode if process.returncode is not None else -1
+        if error is None and exit_code != 0:
+            error = f"Command exited with code {exit_code}"
+        return json.dumps({
+            "ok": error is None, "content": output or "(no output)", "error": error,
+            "metadata": {
+                "exit_code": exit_code, "timed_out": status == "timed_out", "encoding": encoding,
+                "output_refs": refs,
+                "stdout_chars": captures["stdout"].source_chars, "stderr_chars": captures["stderr"].source_chars,
+                "preview_truncated": any(capture.truncated for capture in captures.values()),
+                "warnings": warnings,
+            },
+            # Keep legacy fields for existing clients.
+            "output": output or "(no output)", "exit_code": exit_code,
+        }, ensure_ascii=False)
+    finally:
+        for capture in captures.values():
+            capture.close()
 
 
 def terminal_check() -> bool:

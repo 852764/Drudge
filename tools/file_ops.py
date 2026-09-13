@@ -1,10 +1,11 @@
 """文件操作工具集 — read_file, write_file, search_files, patch"""
 
-import difflib
 import json
 import re
 from pathlib import Path
 from .context import ToolContext
+from .file_io import FileConflictError, atomic_write, check_expected_hash, read_bytes, sha256
+from .file_io import text_diff as _diff_summary
 from .registry import registry
 from .result import ToolResult
 from .risk import RiskLevel, ToolRisk
@@ -25,42 +26,6 @@ def _resolve_path(
     return context.resolve_path(path)
 
 
-def _is_sensitive_path(path: Path) -> bool:
-    parts = {part.lower() for part in path.parts}
-    name = path.name.lower()
-    return name == "auth.json" and ({".drudge", ".codex"} & parts)
-
-
-def _safe_read_text(path: Path) -> str | None:
-    if not path.exists():
-        return None
-    try:
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        raise
-    except OSError:
-        return None
-
-
-def _diff_summary(path: Path, before: str | None, after: str | None, *, limit: int = 24) -> str:
-    before_lines = (before or "").splitlines()
-    after_lines = (after or "").splitlines()
-    diff = list(
-        difflib.unified_diff(
-            before_lines,
-            after_lines,
-            fromfile=str(path),
-            tofile=str(path),
-            lineterm="",
-        )
-    )
-    if not diff:
-        return ""
-    if len(diff) > limit:
-        diff = diff[:limit] + ["... (truncated)"]
-    return "\n".join(diff)
-
-
 def _record_file_change(
     context: ToolContext | None,
     *,
@@ -69,9 +34,9 @@ def _record_file_change(
     before_content: str | None,
     after_content: str | None,
     diff_summary: str,
-) -> None:
+) -> bool:
     if context is None or context.record_file_change is None:
-        return
+        return False
     context.record_file_change({
         "path": str(path),
         "operation": operation,
@@ -79,6 +44,53 @@ def _record_file_change(
         "after_content": after_content,
         "diff_summary": diff_summary,
     })
+    return True
+
+
+def _commit_text_change(
+    path: Path,
+    before: bytes | None,
+    content: str,
+    context: ToolContext,
+    *,
+    operation: str,
+) -> dict:
+    after = content.encode("utf-8")
+    before_text = before.decode("utf-8") if before is not None else None
+    changed = before != after
+    diff_summary = _diff_summary(path, before_text, content)
+    result = {
+        "success": True,
+        "path": str(path),
+        "changed": changed,
+        "sha256": sha256(after),
+        "before_sha256": sha256(before),
+        "diff_summary": diff_summary,
+        "checkpoint_created": False,
+    }
+    if not changed:
+        return result
+    atomic_write(path, after, expected=before)
+    try:
+        result["checkpoint_created"] = _record_file_change(
+            context, path=path, operation=operation,
+            before_content=before_text, after_content=content,
+            diff_summary=diff_summary,
+        )
+    except Exception as exc:
+        # The file has already changed. Do not invite a repeat mutation.
+        result["warnings"] = [f"File saved, but checkpoint recording failed: {exc}"]
+    return result
+
+
+def _edit_failure(exc: Exception) -> ToolResult:
+    if isinstance(exc, FileConflictError):
+        return ToolResult.failure(
+            str(exc), conflict=True,
+            expected_sha256=exc.expected_sha256,
+            actual_sha256=exc.actual_sha256,
+        )
+    return ToolResult.failure(str(exc), blocked=isinstance(exc, PermissionError))
 
 
 def read_file_handler(
@@ -86,41 +98,32 @@ def read_file_handler(
     offset: int = 1,
     limit: int = 500,
     context: ToolContext | None = None,
-) -> str:
+) -> str | ToolResult:
     """读取文件内容，返回带行号的内容"""
     try:
         filepath = _resolve_path(path, context)
     except PermissionError as e:
         return ToolResult.failure(str(e), blocked=True)
-    if _is_sensitive_path(filepath):
-        return ToolResult.failure("Reading credential files is blocked", blocked=True)
-    if not filepath.exists():
-        return json.dumps({"error": f"File not found: {filepath}"})
-
-    # 检测二进制文件
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            pass
-    except UnicodeDecodeError:
-        return json.dumps({"error": "Binary file detected. Cannot read as text."})
-
-    lines = []
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            all_lines = f.readlines()
-            total = len(all_lines)
-            start = max(0, offset - 1)
-            end = min(start + limit, total)
-            for i in range(start, end):
-                lines.append(f"{i + 1}|{all_lines[i].rstrip()}")
+        if offset < 1 or limit < 1:
+            raise ValueError("offset and limit must be positive integers")
+        data = read_bytes(filepath)
+        if data is None:
+            return ToolResult.failure(f"File not found: {filepath}")
+        all_lines = data.decode("utf-8").splitlines()
+        total = len(all_lines)
+        start = offset - 1
+        end = min(start + limit, total)
+        lines = [f"{i + 1}|{all_lines[i]}" for i in range(start, end)]
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return _edit_failure(e)
 
     return json.dumps({
         "content": "\n".join(lines),
         "total_lines": total,
         "shown_lines": len(lines),
         "offset": start + 1,
+        "sha256": sha256(data),
     }, ensure_ascii=False)
 
 
@@ -128,43 +131,26 @@ def write_file_handler(
     path: str,
     content: str,
     context: ToolContext | None = None,
-) -> str:
+    expected_sha256: str | None = None,
+) -> dict | ToolResult:
     """写入文件内容（覆盖）"""
     try:
         filepath = _resolve_path(path, context)
     except PermissionError as e:
         return ToolResult.failure(str(e), blocked=True)
-    if _is_sensitive_path(filepath):
-        return ToolResult.failure("Editing credential files is blocked", blocked=True)
     if context is None:
         return ToolResult.failure("ToolContext is required", blocked=True)
     allowed, reason = context.mutation_allowed(f"write_file {filepath}")
     if not allowed:
         return ToolResult.failure(reason or "Write blocked", blocked=True)
     try:
-        before_content = _safe_read_text(filepath)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
-        diff_summary = _diff_summary(filepath, before_content, content)
-        _record_file_change(
-            context,
-            path=filepath,
-            operation="write_file",
-            before_content=before_content,
-            after_content=content,
-            diff_summary=diff_summary,
-        )
-        return {
-            "success": True,
-            "path": str(filepath),
-            "size": len(content),
-            "changed": before_content != content,
-            "diff_summary": diff_summary,
-            "checkpoint_created": bool(context.record_file_change),
-        }
+        before = read_bytes(filepath)
+        check_expected_hash(filepath, before, expected_sha256)
+        result = _commit_text_change(filepath, before, content, context, operation="write_file")
+        result["size"] = len(content)
+        return result
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return _edit_failure(e)
 
 
 def search_files_handler(
@@ -173,14 +159,12 @@ def search_files_handler(
     file_glob: str | None = None,
     limit: int = 50,
     context: ToolContext | None = None,
-) -> str:
+) -> str | ToolResult:
     """搜索文件内容"""
     try:
         search_path = _resolve_path(path, context)
     except PermissionError as e:
         return ToolResult.failure(str(e), blocked=True)
-    if _is_sensitive_path(search_path):
-        return ToolResult.failure("Searching credential files is blocked", blocked=True)
     if not search_path.exists():
         return json.dumps({"error": f"Path not found: {search_path}"})
 
@@ -204,6 +188,8 @@ def search_files_handler(
         if len(matches) >= limit:
             break
         try:
+            # Authorize discovered symlinks as well as the search directory.
+            filepath = _resolve_path(str(filepath), context)
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 for line_no, line in enumerate(f, 1):
                     if regex.search(line):
@@ -230,7 +216,8 @@ def patch_handler(
     new_string: str,
     replace_all: bool = False,
     context: ToolContext | None = None,
-) -> str:
+    expected_sha256: str | None = None,
+) -> str | dict | ToolResult:
     """在文件中查找替换"""
     try:
         filepath = _resolve_path(path, context)
@@ -241,16 +228,25 @@ def patch_handler(
     allowed, reason = context.mutation_allowed(f"patch {filepath}")
     if not allowed:
         return ToolResult.failure(reason or "Patch blocked", blocked=True)
-    if _is_sensitive_path(filepath):
-        return ToolResult.failure("Editing credential files is blocked", blocked=True)
-    if not filepath.exists():
-        return json.dumps({"error": f"File not found: {filepath}"})
 
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-    except UnicodeDecodeError:
-        return json.dumps({"error": "Binary file detected"})
+        if not old_string:
+            raise ValueError("old_string must not be empty")
+        before = read_bytes(filepath)
+        check_expected_hash(filepath, before, expected_sha256)
+        if before is None:
+            return ToolResult.failure(f"File not found: {filepath}")
+        content = before.decode("utf-8")
+    except Exception as exc:
+        return _edit_failure(exc)
+
+    # Adapt LF model text to uniformly CRLF sources, not mixed-line-ending files.
+    without_crlf = content.replace("\r\n", "")
+    if "\r\n" in content and "\n" not in without_crlf and "\r" not in without_crlf:
+        if "\r" not in old_string:
+            old_string = old_string.replace("\n", "\r\n")
+        if "\r" not in new_string:
+            new_string = new_string.replace("\n", "\r\n")
 
     count = content.count(old_string)
     if count == 0:
@@ -263,26 +259,11 @@ def patch_handler(
 
     new_content = content.replace(old_string, new_string)
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(new_content)
-        diff_summary = _diff_summary(filepath, content, new_content)
-        _record_file_change(
-            context,
-            path=filepath,
-            operation="patch",
-            before_content=content,
-            after_content=new_content,
-            diff_summary=diff_summary,
-        )
-        return {
-            "success": True,
-            "path": str(filepath),
-            "replacements": count,
-            "diff_summary": diff_summary,
-            "checkpoint_created": bool(context.record_file_change),
-        }
+        result = _commit_text_change(filepath, before, new_content, context, operation="patch")
+        result["replacements"] = count
+        return result
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return _edit_failure(e)
 
 
 def apply_patch_handler(
@@ -291,9 +272,10 @@ def apply_patch_handler(
     new_string: str,
     replace_all: bool = False,
     context: ToolContext | None = None,
-) -> str:
+    expected_sha256: str | None = None,
+) -> str | dict | ToolResult:
     """First-class patch tool for targeted source edits."""
-    return patch_handler(path, old_string, new_string, replace_all, context)
+    return patch_handler(path, old_string, new_string, replace_all, context, expected_sha256)
 
 
 def file_check() -> bool:
@@ -304,7 +286,8 @@ def file_check() -> bool:
 registry.register(
     name="read_file",
     description="Read a text file with line numbers. Output format: 'LINE_NUM|CONTENT'. "
-    "Use offset and limit for large files. NOTE: Cannot read images or binary files.",
+    "Use offset and limit for large files. Includes whole-file sha256 for guarded edits. "
+    "NOTE: Cannot read images or binary files.",
     parameters={
         "path": {"type": str, "description": "Path to the file (absolute, relative, or ~/path)"},
         "offset": {"type": int, "description": "Line number to start from (1-indexed, default: 1)"},
@@ -318,10 +301,12 @@ registry.register(
 
 registry.register(
     name="write_file",
-    description="Write content to a file, overwriting existing content. Creates parent directories automatically.",
+    description="Atomically write exact UTF-8 content. Creates parent directories automatically. "
+    "Pass expected_sha256 from read_file to detect stale edits, or 'missing' to create a new file only.",
     parameters={
         "path": {"type": str, "description": "Path to the file to write"},
         "content": {"type": str, "description": "Complete content to write to the file"},
+        "expected_sha256": {"type": str, "description": "Expected whole-file SHA-256 from read_file, or 'missing' (optional)"},
     },
     handler=write_file_handler,
     toolset="file",
@@ -353,6 +338,7 @@ registry.register(
         "old_string": {"type": str, "description": "Exact text to find"},
         "new_string": {"type": str, "description": "Replacement text"},
         "replace_all": {"type": bool, "description": "Replace all occurrences (default: false)"},
+        "expected_sha256": {"type": str, "description": "Expected whole-file SHA-256 from read_file (optional)"},
     },
     handler=patch_handler,
     toolset="file",
@@ -369,6 +355,7 @@ registry.register(
         "old_string": {"type": str, "description": "Exact text to replace"},
         "new_string": {"type": str, "description": "Replacement text"},
         "replace_all": {"type": bool, "description": "Replace all occurrences (default: false)"},
+        "expected_sha256": {"type": str, "description": "Expected whole-file SHA-256 from read_file (optional)"},
     },
     handler=apply_patch_handler,
     toolset="file",

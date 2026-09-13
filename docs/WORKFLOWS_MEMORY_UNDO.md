@@ -105,6 +105,11 @@ Commands:
 
 `/undo` reverts the most recent reversible file change in the active session.
 
+`/undo --dry-run` previews the reverse diff without changing files. Undo now
+checks that the current bytes still match the checkpoint and preserves later
+user edits on conflict. See [Reliable file edits](RELIABLE_FILE_EDITS.md) for
+guarded writes, byte-exact checkpoints, and legacy migration behavior.
+
 Tool results for file mutations now include:
 
 - `diff_summary`
