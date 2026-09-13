@@ -9,14 +9,14 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-from agent import Agent, AgentRuntime
+from agent import Agent, AgentRuntime, RunStatus
 from agent.cli_renderer import CliRenderer
 from agent.llm import create_client
 from config import ConfigManager, get_config
 from tools import ApprovalDecision, ApprovalRequest
 
 
-VERSION = "0.2.0b1"
+VERSION = "0.2.0b2"
 
 
 class ConsoleApproval:
@@ -275,7 +275,7 @@ async def run_query(
     approval_mode: str | None = None,
     resume_id: str | None = None,
     skill_names: list[str] | None = None,
-) -> None:
+) -> int:
     """执行单次查询"""
     config = get_config(config_path, codex_config_path)
     renderer = _make_renderer(config)
@@ -284,6 +284,7 @@ async def run_query(
         config.override("toolsets", value=toolsets)
     if no_tools:
         config.override("toolsets", value=[])
+        config.override("agent", "tools_enabled", value=False)
     if model:
         config.override("model", "name", value=model)
     if codex_oauth:
@@ -307,13 +308,17 @@ async def run_query(
         await _run_and_print(agent, query, renderer)
     except asyncio.CancelledError:
         renderer.print_note("Cancelled.", level="warning", error=True)
+        return 130
     except Exception as e:
         renderer.print_note(f"Error: {e}", level="error", error=True)
-        sys.exit(1)
+        return 1
 
     usage = agent.get_token_usage()
     if config.get("display", "show_cost"):
         renderer.print_usage(usage, session_id=agent.session_id)
+    return {
+        RunStatus.COMPLETED: 0, RunStatus.MAX_TURNS: 2, RunStatus.CANCELLED: 130,
+    }.get(agent.run_state.status, 1)
 
 
 async def show_models(
@@ -380,6 +385,7 @@ async def run_status(
         config.override("model", "name", value=model)
     if no_tools:
         config.override("toolsets", value=[])
+        config.override("agent", "tools_enabled", value=False)
     if codex_oauth:
         config.enable_codex_oauth()
     if approval_mode:
@@ -429,6 +435,7 @@ def run_interactive(
         config.override("model", "name", value=model)
     if no_tools:
         config.override("toolsets", value=[])
+        config.override("agent", "tools_enabled", value=False)
     if codex_oauth:
         config.enable_codex_oauth()
     if approval_mode:
@@ -476,6 +483,7 @@ def _run_simple_interactive(
         config.override("model", "name", value=model)
     if no_tools:
         config.override("toolsets", value=[])
+        config.override("agent", "tools_enabled", value=False)
     if codex_oauth:
         config.enable_codex_oauth()
     if approval_mode:
@@ -1130,6 +1138,7 @@ def run_doctor(
         config.override("model", "name", value=model)
     if no_tools:
         config.override("toolsets", value=[])
+        config.override("agent", "tools_enabled", value=False)
     if codex_oauth:
         config.enable_codex_oauth()
     if approval_mode:
@@ -1315,7 +1324,7 @@ def main():
     if args.query:
         # 单次查询
         try:
-            asyncio.run(run_query(
+            raise SystemExit(asyncio.run(run_query(
                 args.query,
                 config_path=args.config,
                 codex_config_path=args.codex_config,
@@ -1326,9 +1335,10 @@ def main():
                 approval_mode=args.approval_mode,
                 resume_id=args.resume,
                 skill_names=args.skill,
-            ))
+            )))
         except KeyboardInterrupt:
             print("\nCancelled.", file=sys.stderr)
+            raise SystemExit(130)
     else:
         # 交互模式
         run_interactive(

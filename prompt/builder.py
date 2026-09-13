@@ -11,6 +11,8 @@ def build_system_prompt(
     repo_map: str | None = None,
     project_instructions: str | None = None,
     skill_catalog: list[tuple[str, str]] | None = None,
+    workspace: str | None = None,
+    tools_enabled: bool = True,
 ) -> str:
     """组装 system prompt"""
     parts = []
@@ -19,13 +21,16 @@ def build_system_prompt(
     parts.append(_agent_identity())
 
     # 2. 环境信息
-    parts.append(_environment_hints())
+    parts.append(_environment_hints(workspace))
 
     if project_instructions:
         parts.append(_project_instructions_section(project_instructions))
 
     # 3. 工具使用说明
-    parts.append(_tool_usage_instructions(toolsets))
+    parts.append(_tool_usage_instructions(toolsets) if tools_enabled else (
+        "TOOLS DISABLED BY HOST: No local, plan, memory, output or MCP tools are available. "
+        "Answer from the conversation; do not invent tool results or claim to execute commands."
+    ))
 
     if repo_map:
         parts.append(_repo_map_section(repo_map))
@@ -61,14 +66,15 @@ Key principles:
 - Never output vendor reasoning tags or hidden chain-of-thought."""
 
 
-def _environment_hints() -> str:
+def _environment_hints(workspace: str | None = None) -> str:
     system = platform.system()
     home = os.path.expanduser("~")
-    cwd = os.getcwd()
+    cwd = os.path.abspath(os.path.expanduser(workspace)) if workspace else os.getcwd()
 
     hints = f"""Host: {system}
 User home directory: {home}
-Current working directory: {cwd}"""
+Current working directory: {cwd}
+Relative file paths and the terminal's default working directory use this workspace, not the launcher directory."""
 
     if system == "Windows":
         hints += f"""
@@ -86,6 +92,7 @@ def _tool_usage_instructions(toolsets: list[str]) -> str:
 
 Tool usage rules:
 - Call tools directly when you need to take action.
+- Use read_files for multiple independent files instead of spending one model turn on each read_file. Group independent tool calls when practical.
 - For complex or multi-step tasks, call update_plan first with a short ordered plan.
 - Keep the plan current: exactly one step should be in_progress until all steps are completed.
 - After completing a planned step, call update_plan again before moving to the next step.
@@ -98,6 +105,7 @@ Tool usage rules:
 - For a new file, use write_file with expected_sha256="missing" to avoid overwriting an existing file.
 - On a file conflict, re-read and review the current content; do not just drop the expected_sha256 guard.
 - A successful edit with checkpoint_created=false and warnings is already saved; report the checkpoint warning instead of repeating the edit.
+- After successful guarded edits, prioritize running the requested tests over rereading every changed file. Reread for conflicts, errors or a specific inspection need. Reserve time for actual verification and the final report.
 - Tool results use a standard JSON envelope: ok, content, error, metadata, blocked.
 - Terminal success is determined by ok and exit_code, not by whether stderr contains text.
 - Large outputs contain a head/tail preview and metadata.output_ref; read_tool_output retrieves the original by ID with offset/limit pagination.

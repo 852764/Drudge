@@ -36,6 +36,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # Missing fields inherit from "model"; null means reuse the primary client.
     "utility_model": None,
     "agent": {
+        "tools_enabled": True,
         "max_turns": 50,
         "compression_threshold": 0.80,
         "compact_keep_recent": 8,

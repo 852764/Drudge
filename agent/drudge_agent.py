@@ -73,6 +73,10 @@ class Agent:
         ] | None = None,
     ):
         self.config = config or get_config()
+        self._tools_enabled = self.config.get("agent", "tools_enabled", default=True)
+        if not isinstance(self._tools_enabled, bool):
+            raise ValueError("agent.tools_enabled must be a boolean")
+        self._enabled_toolsets = self.config.get_toolsets() if self._tools_enabled else []
         self.llm: LLMClient | None = None
         self.utility_llm: LLMClient | None = None
         self.refusal_llm: LLMClient | None = None
@@ -114,7 +118,7 @@ class Agent:
         self._init_store()
         task_provider = None
         memory_provider = None
-        if self.store is not None:
+        if self.store is not None and self._tools_enabled:
             task_provider = TaskToolProvider(
                 self.list_tasks,
                 self.create_task,
@@ -126,7 +130,7 @@ class Agent:
                 self.update_memory,
                 self.delete_memory,
             )
-        plan_provider = PlanToolProvider(self.update_plan)
+        plan_provider = PlanToolProvider(self.update_plan) if self._tools_enabled else None
         selection_enabled = bool(
             self.config.get("tool_selection", "enabled", default=True)
         )
@@ -137,19 +141,19 @@ class Agent:
                     self.config.get("tool_selection", "search_limit", default=5)
                 ),
             )
-            if selection_enabled
+            if selection_enabled and self._tools_enabled
             else None
         )
         self.tool_provider = create_tool_provider(
             registry,
-            self.config.get_toolsets(),
-            self.config.get("mcp_servers", default={}) or {},
+            self._enabled_toolsets,
+            (self.config.get("mcp_servers", default={}) or {}) if self._tools_enabled else {},
             workspace,
             task_provider=task_provider,
             plan_provider=plan_provider,
             memory_provider=memory_provider,
             search_provider=search_provider,
-            output_provider=OutputToolProvider() if self.store else None,
+            output_provider=OutputToolProvider() if self.store and self._tools_enabled else None,
         )
 
     def cancel(self) -> None:
@@ -262,11 +266,9 @@ class Agent:
                 turn_streamed = True
                 await self._emit(stream_callback, visible)
 
-            request_messages = (
-                self._reasoning_recovery_messages(self._messages)
-                if attempt > 0
-                else self._messages
-            )
+            request_messages = self._budgeted_model_messages()
+            if attempt > 0:
+                request_messages = self._reasoning_recovery_messages(request_messages)
             model_started = monotonic()
             purpose = "reasoning_recovery" if attempt > 0 else "agent"
             try:
@@ -360,6 +362,28 @@ class Agent:
         if last_result is not None:
             return last_result
         raise RuntimeError("Model reasoning recovery failed without a response")
+
+    def _budgeted_model_messages(self) -> list[dict]:
+        """Add host turn guidance to the request, never to durable user history."""
+        maximum = int(self.config.get("agent", "max_turns", default=50))
+        remaining = max(0, maximum - self.run_state.turn + 1)
+        note = f"\n\nHOST LOOP BUDGET: {remaining} of {maximum} turns remaining (including this turn). "
+        if self._tools_enabled:
+            note += (
+                "Batch independent reads. Reserve turns for executable acceptance checks and a final report; "
+                "avoid redundant rereads after successful guarded edits. Never claim tests passed without actual results. "
+                "A budget limit does not grant tool approval or change permissions."
+            )
+        else:
+            note += "Tools are disabled; answer using the available conversation only."
+        messages = list(self._messages)
+        for index, message in enumerate(messages):
+            if message.get("role") == "system":
+                messages[index] = {**message, "content": str(message.get("content") or "") + note}
+                break
+        else:
+            messages.insert(0, {"role": "system", "content": note.strip()})
+        return messages
 
     @staticmethod
     def _reasoning_recovery_messages(messages: list[dict]) -> list[dict]:
@@ -1233,7 +1257,9 @@ class Agent:
 
         self.tool_context = ToolContext.from_config(
             security,
-            self.config.get_toolsets(),
+            # Providers are fixed for this Agent, but host revocations must take
+            # effect when refreshing a context (including undo and resume).
+            self.config.get_toolsets() if self._tools_enabled else [],
             session_id=self.session_id,
             run_id=self._current_run_id,
             record_file_change=self._record_file_change if self.store else None,
@@ -1296,7 +1322,7 @@ class Agent:
         memory_entries: list[str] | None = None,
         extra_skills: list[str] | None = None,
     ) -> str:
-        toolsets = self.config.get_toolsets()
+        toolsets = self._enabled_toolsets
         workspace = self.config.get("security", "workspace_root", default=".")
         repo_map = None
         if self.config.get("agent", "repo_map_enabled", default=True):
@@ -1329,6 +1355,8 @@ class Agent:
             repo_map=repo_map,
             project_instructions=project_instructions,
             skill_catalog=catalog,
+            workspace=str(Path(workspace).expanduser().resolve()),
+            tools_enabled=self._tools_enabled,
         )
         if self.store and self.session_id:
             tasks = self.store.list_tasks(self.session_id)
@@ -1379,7 +1407,7 @@ class Agent:
         self.session_id = self.store.create_session(
             prompt,
             model,
-            cwd=str(Path.cwd()),
+            cwd=str(self.tool_context.workspace),
             metadata={"active_skills": list(self.active_skill_names)},
         )
         self._refresh_tool_context()
@@ -1537,6 +1565,8 @@ class Agent:
         await self._prepare_tool_selection(prompt)
 
         max_turns = self.config.get_agent_config().get("max_turns", 50)
+        if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 1:
+            raise ValueError("agent.max_turns must be a positive integer")
         compression_threshold = self.config.get_agent_config().get("compression_threshold", 0.80)
 
         final_text = ""
@@ -1597,6 +1627,17 @@ class Agent:
             self._total_tokens += attempt_tokens
 
             finish_reason = self.llm.extract_finish_reason(response)
+            if finish_reason not in {"stop", "tool_calls", "function_call"}:
+                error_msg = (
+                    f"Model response did not complete (finish_reason={finish_reason}). "
+                    "No tool calls from this response were executed."
+                )
+                if text:
+                    self._messages.append({"role": "assistant", "content": text})
+                    self._persist_message("assistant", text, metadata={"incomplete": True, "finish_reason": finish_reason})
+                self._transition(RunStatus.FAILED, turn=request_turn, error=error_msg)
+                final_text = f"{text}\n\n[{error_msg}]" if text else error_msg
+                break
             if reasoning_only:
                 error_msg = (
                     "Model returned only <think> reasoning and no final answer, "
@@ -1745,7 +1786,10 @@ class Agent:
             final_text = f"[Agent reached maximum turns ({max_turns}). Task may be incomplete.]"
 
         try:
-            reviewed = await self._review_refusal_if_needed(prompt, final_text, stream_callback)
+            reviewed = (
+                await self._review_refusal_if_needed(prompt, final_text, stream_callback)
+                if self.run_state.status is RunStatus.COMPLETED else final_text
+            )
         except asyncio.CancelledError:
             self._transition(RunStatus.CANCELLED, turn=self.run_state.turn)
             raise

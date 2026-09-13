@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 from typing import Any, Callable
 
 import httpx
@@ -24,7 +25,7 @@ class LLMClient:
         api_type: str = "auto",
         default_headers: dict[str, str] | None = None,
         query_params: dict[str, Any] | None = None,
-        timeout: int = 120,
+        timeout: float = 120,
         max_retries: int = 3,
         reasoning_effort: str | None = None,
         disable_response_storage: bool = False,
@@ -39,6 +40,8 @@ class LLMClient:
         self.api_type = api_type
         self.default_headers = dict(default_headers or {})
         self.query_params = dict(query_params or {})
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("model.timeout must be a positive finite number")
         self.timeout = timeout
         self.max_retries = max_retries
         self.reasoning_effort = reasoning_effort
@@ -362,7 +365,9 @@ class LLMClient:
                                     "response.failed",
                                 ):
                                     saw_terminal = True
-                                    terminal = event.get("response") or {}
+                                    terminal = dict(event.get("response") or {})
+                                    if event_type == "response.incomplete":
+                                        terminal["status"] = "incomplete"
                                     if event_type == "response.failed":
                                         raise RuntimeError(f"Responses stream failed: {terminal.get('error') or event}")
                                     break
@@ -517,14 +522,14 @@ class LLMClient:
                     parts.append(content["text"])
         text = data.get("output_text") or "".join(parts)
         status = data.get("status", "completed")
-        if tool_calls:
-            finish_reason = "tool_calls"
-        elif status == "completed":
-            finish_reason = "stop"
-        elif status == "incomplete":
+        if status == "incomplete":
             finish_reason = "length"
-        else:
+        elif status != "completed":
             finish_reason = status
+        elif tool_calls:
+            finish_reason = "tool_calls"
+        else:
+            finish_reason = "stop"
         return {
             "id": data.get("id", ""),
             "model": data.get("model", model),
@@ -619,6 +624,7 @@ def create_client(config: dict) -> LLMClient:
         api_type=config.get("api", "auto"),
         default_headers=config.get("headers", {}),
         query_params=config.get("query_params", {}),
+        timeout=config.get("timeout", 120),
         max_retries=config.get("max_retries", 3),
         reasoning_effort=config.get("reasoning_effort"),
         disable_response_storage=bool(config.get("disable_response_storage", False)),

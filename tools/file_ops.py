@@ -7,7 +7,7 @@ from .context import ToolContext
 from .file_io import FileConflictError, atomic_write, check_expected_hash, read_bytes, sha256
 from .file_io import text_diff as _diff_summary
 from .registry import registry
-from .result import ToolResult
+from .result import ToolResult, normalize_tool_payload, limit_tool_result
 from .risk import RiskLevel, ToolRisk
 
 
@@ -125,6 +125,41 @@ def read_file_handler(
         "offset": start + 1,
         "sha256": sha256(data),
     }, ensure_ascii=False)
+
+
+def read_files_handler(
+    paths: list[str], offset: int = 1, limit: int = 200,
+    context: ToolContext | None = None,
+) -> ToolResult:
+    """Read a bounded group in one model round, preserving per-file outcomes."""
+    if context is None:
+        return ToolResult.failure("ToolContext is required", blocked=True)
+    if not isinstance(paths, list) or not 1 <= len(paths) <= 8:
+        return ToolResult.failure("paths must contain between 1 and 8 file paths")
+    if any(not isinstance(path, str) or not path.strip() or len(path) > 4096 for path in paths):
+        return ToolResult.failure("Each path must be a nonempty string of at most 4096 characters")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 1:
+        return ToolResult.failure("offset must be a positive integer")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+        return ToolResult.failure("limit must be between 1 and 500 lines per file")
+    results = []
+    for path in paths:
+        payload = read_file_handler(path, offset=offset, limit=limit, context=context)
+        save = None
+        if context.save_tool_output is not None:
+            def save(content):
+                return context.save_tool_output(content, tool_name="read_files.item", kind="json")
+        bounded = limit_tool_result(payload, max_chars=6000, save_output=save)
+        results.append({"path": path, **normalize_tool_payload(bounded)})
+    failed = sum(not result["ok"] for result in results)
+    content = json.dumps(results, ensure_ascii=False)
+    metadata = {"files_read": len(results) - failed, "files_failed": failed}
+    if failed:
+        return ToolResult.failure(
+            f"{failed} of {len(results)} files could not be read; inspect each result.",
+            content=content, **metadata,
+        )
+    return ToolResult.success(content, **metadata)
 
 
 def write_file_handler(
@@ -297,6 +332,19 @@ registry.register(
     toolset="file",
     check_fn=file_check,
     required=["path"],
+)
+
+registry.register(
+    name="read_files",
+    description="Read up to 8 independent text files in one call. Returns per-file line numbers, whole-file SHA-256 and errors. "
+    "Prefer this to separate read_file calls when inspecting several files. Large results have bounded previews and output receipts.",
+    parameters={
+        "paths": {"type": list, "items": {"type": "string"}, "minItems": 1, "maxItems": 8,
+                  "description": "File paths to read; each is checked against the host workspace and credential policy"},
+        "offset": {"type": int, "minimum": 1, "description": "First line in each file (default: 1)"},
+        "limit": {"type": int, "minimum": 1, "maximum": 500, "description": "Lines per file (default: 200, max: 500)"},
+    },
+    handler=read_files_handler, toolset="file", check_fn=file_check, required=["paths"],
 )
 
 registry.register(

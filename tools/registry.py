@@ -3,6 +3,7 @@
 import json
 import asyncio
 import inspect
+from copy import deepcopy
 from typing import Any, Callable
 
 from .context import ToolContext
@@ -54,6 +55,11 @@ class ToolRegistry:
                 prop["enum"] = param_info["enum"]
             if "default" in param_info:
                 prop["default"] = param_info["default"]
+            # These constraints come from trusted registration metadata. Handlers
+            # still validate nested shapes and bounds before performing I/O.
+            for keyword in ("items", "minItems", "maxItems", "minimum", "maximum", "maxLength"):
+                if keyword in param_info:
+                    prop[keyword] = deepcopy(param_info[keyword])
             properties[param_name] = prop
 
         schema = {
