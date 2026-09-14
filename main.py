@@ -16,7 +16,7 @@ from config import ConfigManager, get_config
 from tools import ApprovalDecision, ApprovalRequest
 
 
-VERSION = "0.2.0b2"
+VERSION = "0.2.0b3"
 
 
 class ConsoleApproval:

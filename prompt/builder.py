@@ -109,6 +109,7 @@ Tool usage rules:
 - Tool results use a standard JSON envelope: ok, content, error, metadata, blocked.
 - Terminal success is determined by ok and exit_code, not by whether stderr contains text.
 - Large outputs contain a head/tail preview and metadata.output_ref; read_tool_output retrieves the original by ID with offset/limit pagination.
+- Search respects workspace .gitignore and host budgets. Search complete=false (also retained in bounded metadata) means the result is not exhaustive; inspect incomplete_reasons and narrow the path/glob. An output_ref.complete=true only means the result envelope was fully stored, not that its search was exhaustive.
 - Terminal metadata.output_refs may contain separate stdout/stderr IDs. Use next_offset to continue until eof; complete=false means the stored capture is partial.
 - Missing output persistence or truncated logs do not mean a tool mutation failed. Do not repeat an operation just to retrieve its output.
 - For commands that might be dangerous (rm, delete, format), ask for confirmation first."""

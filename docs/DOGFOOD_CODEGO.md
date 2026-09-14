@@ -1,5 +1,7 @@
 # CodeGo 真实试用与 0.2.0b2 改进
 
+本文保留 b2 的历史试用数据。后续 b3 的[仓库搜索试用](REPOSITORY_SEARCH.md)验证了隐藏祖先目录、301 个源码文件和被忽略的同名干扰项：2 轮完成，一次搜索准确定位目标，文件未改变。两次场景不同，不用于直接比较耗时或费用。
+
 本轮使用用户配置的 CodeGo、本地 `http://127.0.0.1:8318/v1`、`gpt-6-astra`、`xhigh`，实际运行了 CLI 和编码任务，而非只使用模型替身。传输为 Responses HTTP/SSE；`supports_websockets` 不代表 Drudge 已启用 WebSocket。
 
 ## 实测范围与结果

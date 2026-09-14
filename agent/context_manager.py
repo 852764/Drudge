@@ -3,51 +3,42 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 from typing import Any
-
-
-DEFAULT_EXCLUDE_DIRS = {
-    ".git",
-    ".drudge",
-    ".drudge-live",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".venv",
-    "venv",
-    "node_modules",
-    "dist",
-    "build",
-}
+from tools.repository import RepositoryWalker, DEFAULT_EXCLUDE_DIRS
 
 
 def build_repo_map(root: str | Path, *, max_files: int = 80, max_depth: int = 3) -> str:
+    if isinstance(max_files, bool) or not isinstance(max_files, int) or max_files < 0:
+        raise ValueError("max_files must be a non-negative integer")
+    if isinstance(max_depth, bool) or not isinstance(max_depth, int) or not 0 <= max_depth <= 64:
+        raise ValueError("max_depth must be between 0 and 64")
     base = Path(root).expanduser().resolve()
-    if not base.exists():
+    if not base.is_dir():
         return f"Repository map unavailable; workspace does not exist: {base}"
 
     lines = [f"Repository map for: {base}"]
+    if max_files == 0:
+        return "\n".join(lines + ["... file listing disabled (max_files=0)"])
+    walker = RepositoryWalker(base, max_depth=max_depth)
+    shown_directories: set[Path] = set()
     count = 0
-    for current, dirs, files in os.walk(base):
-        current_path = Path(current)
-        rel = current_path.relative_to(base)
-        depth = 0 if rel == Path(".") else len(rel.parts)
-        dirs[:] = sorted(d for d in dirs if d not in DEFAULT_EXCLUDE_DIRS and not d.startswith("."))
-        if depth >= max_depth:
-            dirs[:] = []
-        if rel != Path("."):
-            lines.append(f"{'  ' * depth}{current_path.name}/")
-        for name in sorted(files):
-            if name.endswith((".pyc", ".db", ".db-shm", ".db-wal")):
-                continue
-            count += 1
-            if count > max_files:
-                lines.append(f"... truncated after {max_files} files")
-                return "\n".join(lines)
-            lines.append(f"{'  ' * (depth + 1)}{name}")
+    for path in walker.files():
+        if count == max_files:
+            lines.append(f"... truncated after {max_files} files")
+            break
+        relative = path.relative_to(base)
+        for index in range(1, len(relative.parts)):
+            directory = Path(*relative.parts[:index])
+            if directory not in shown_directories:
+                shown_directories.add(directory)
+                label = json.dumps(directory.name, ensure_ascii=False)[1:-1]
+                lines.append(f"{'  ' * index}{label}/")
+        label = json.dumps(path.name, ensure_ascii=False)[1:-1]
+        lines.append(f"{'  ' * len(relative.parts)}{label}")
+        count += 1
+    if walker.stats.incomplete_reasons:
+        lines.append("... incomplete discovery: " + ", ".join(sorted(walker.stats.incomplete_reasons)))
     return "\n".join(lines)
 
 

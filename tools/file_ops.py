@@ -2,6 +2,7 @@
 
 import json
 import re
+import os
 from pathlib import Path
 from .context import ToolContext
 from .file_io import FileConflictError, atomic_write, check_expected_hash, read_bytes, sha256
@@ -9,6 +10,7 @@ from .file_io import text_diff as _diff_summary
 from .registry import registry
 from .result import ToolResult, normalize_tool_payload, limit_tool_result
 from .risk import RiskLevel, ToolRisk
+from .repository import RepositoryWalker
 
 
 def _file_mutation_risk(args: dict, context: ToolContext) -> ToolRisk:
@@ -194,54 +196,119 @@ def search_files_handler(
     file_glob: str | None = None,
     limit: int = 50,
     context: ToolContext | None = None,
+    include_hidden: bool = False,
+    literal: bool = False,
+    case_sensitive: bool = False,
 ) -> str | ToolResult:
-    """搜索文件内容"""
+    """Search UTF-8 text with explicit scope, I/O budgets and completeness."""
+    if not isinstance(pattern, str) or not 1 <= len(pattern) <= 4096:
+        return ToolResult.failure("pattern must contain between 1 and 4096 characters")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+        return ToolResult.failure("limit must be an integer between 1 and 1000")
+    if any(not isinstance(value, bool) for value in (include_hidden, literal, case_sensitive)):
+        return ToolResult.failure("include_hidden, literal and case_sensitive must be booleans")
+    if file_glob is not None and (
+        not isinstance(file_glob, str) or not 1 <= len(file_glob) <= 2048
+        or len(file_glob.replace("\\", "/").split("/")) > 64
+        or Path(file_glob).is_absolute() or ".." in file_glob.replace("\\", "/").split("/")
+    ):
+        return ToolResult.failure("file_glob must be a bounded search-root-relative glob")
     try:
         search_path = _resolve_path(path, context)
-    except PermissionError as e:
-        return ToolResult.failure(str(e), blocked=True)
+        regex = re.compile(re.escape(pattern) if literal else pattern, 0 if case_sensitive else re.IGNORECASE)
+    except re.error as exc:
+        return ToolResult.failure(f"Invalid regex: {exc}")
+    except (OSError, ValueError, TypeError) as exc:
+        return _edit_failure(exc)
     if not search_path.exists():
-        return json.dumps({"error": f"Path not found: {search_path}"})
-
-    try:
-        regex = re.compile(pattern, re.IGNORECASE)
-    except re.error as e:
-        return json.dumps({"error": f"Invalid regex: {e}"})
+        return ToolResult.failure(f"Path not found: {search_path}")
+    if not search_path.is_file() and not search_path.is_dir():
+        return ToolResult.failure("Search path must be an ordinary file or directory")
 
     matches = []
-    files_to_search = []
-
-    if search_path.is_file():
-        files_to_search = [search_path]
-    else:
-        glob_pattern = file_glob or "*"
-        for f in search_path.rglob(glob_pattern):
-            if f.is_file() and not any(p.startswith(".") for p in f.parts):
-                files_to_search.append(f)
-
-    for filepath in files_to_search[:200]:
-        if len(matches) >= limit:
+    walker = RepositoryWalker(
+        search_path if search_path.is_dir() else search_path.parent,
+        anchor=context.workspace, authorize=context.resolve_path,
+        include_hidden=include_hidden, max_entries=context.search_max_entries,
+    )
+    reasons = walker.stats.incomplete_reasons
+    skipped = walker.stats.skipped
+    files_scanned = bytes_read = 0
+    candidates = (search_path,) if search_path.is_file() else walker.files(file_glob)
+    for filepath in candidates:
+        if files_scanned >= context.search_max_files:
+            reasons.add("file_limit")
             break
         try:
-            # Authorize discovered symlinks as well as the search directory.
+            # Reauthorize immediately before opening, independently of discovery.
             filepath = _resolve_path(str(filepath), context)
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                for line_no, line in enumerate(f, 1):
-                    if regex.search(line):
-                        matches.append({
-                            "file": str(filepath),
-                            "line": line_no,
-                            "content": line.strip()[:200],
-                        })
-                        if len(matches) >= limit:
-                            break
-        except (UnicodeDecodeError, PermissionError, OSError):
+            info = filepath.stat()
+            if not filepath.is_file():
+                skipped["special"] += 1
+                continue
+            if info.st_size > context.search_max_file_bytes:
+                skipped["too_large"] += 1
+                reasons.add("file_size_limit")
+                continue
+            remaining = context.search_max_total_bytes - bytes_read
+            if info.st_size > remaining:
+                reasons.add("byte_limit")
+                break
+            files_scanned += 1
+            cap = min(context.search_max_file_bytes, remaining)
+            with open(filepath, "rb") as stream:
+                data = stream.read(cap)
+                current_size = os.fstat(stream.fileno()).st_size
+            bytes_read += len(data)
+            if current_size > len(data):
+                skipped["changed_during_read"] += 1
+                reasons.add("file_changed")
+                continue
+            if b"\0" in data:
+                skipped["binary"] += 1
+                continue
+            try:
+                source = data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                skipped["non_utf8"] += 1
+                continue
+            for line_no, line in enumerate(source.splitlines(), 1):
+                match = regex.search(line)
+                if match is None:
+                    continue
+                # Look ahead by one matching line: exactly limit hits at EOF
+                # is a complete result, rather than a spurious truncation.
+                if len(matches) == limit:
+                    reasons.add("match_limit")
+                    break
+                start = max(0, match.start() - 80)
+                matches.append({
+                    "file": str(filepath), "line": line_no,
+                    "column": match.start() + 1,
+                    "content": line[start:start + 200],
+                    "content_start_column": start + 1,
+                })
+            if "match_limit" in reasons:
+                break
+        except (OSError, ValueError, RuntimeError) as exc:
+            skipped["blocked" if isinstance(exc, PermissionError) else "unreadable"] += 1
+            reasons.add("file_unreadable")
             continue
 
     return json.dumps({
         "matches": matches,
         "total": len(matches),
-        "truncated": len(matches) >= limit,
+        "truncated": bool(reasons),
+        "complete": not reasons,
+        "incomplete_reasons": sorted(reasons),
+        "files_scanned": files_scanned, "bytes_read": bytes_read,
+        "entries_seen": walker.stats.entries_seen,
+        "skipped": dict(sorted(skipped.items())),
+        "scope": {"path": str(search_path), "file_glob": file_glob, "include_hidden": include_hidden,
+                  "ignore_policy": "workspace .gitignore (explicit files bypass discovery filters)",
+                  "encoding": "utf-8", "case_sensitive": case_sensitive, "literal": literal},
+        "limits": {"files": context.search_max_files, "file_bytes": context.search_max_file_bytes,
+                   "total_bytes": context.search_max_total_bytes, "entries": context.search_max_entries},
     }, ensure_ascii=False)
 
 
@@ -365,12 +432,16 @@ registry.register(
 
 registry.register(
     name="search_files",
-    description="Search file contents using regex. Returns file paths, line numbers, and matching content.",
+    description="Search UTF-8 files using regex or literal text. Respects workspace/nested .gitignore and reports skipped files and incomplete scans. "
+    "Returns paths, one-based lines/columns, and match-centered snippets. Narrow path/glob when a host budget is reached.",
     parameters={
         "pattern": {"type": str, "description": "Regex pattern to search for"},
         "path": {"type": str, "description": "Directory or file to search in (default: current directory)"},
-        "file_glob": {"type": str, "description": "Optional glob filter (e.g., '*.py')"},
-        "limit": {"type": int, "description": "Maximum results (default: 50)"},
+        "file_glob": {"type": str, "description": "Optional case-sensitive glob: '*.py' at any depth, or root-relative 'src/**/*.py'"},
+        "limit": {"type": int, "minimum": 1, "maximum": 1000, "description": "Maximum matching lines (default: 50, max: 1000)"},
+        "include_hidden": {"type": bool, "description": "Include ordinary hidden paths, still excluding private/runtime directories (default: false)"},
+        "literal": {"type": bool, "description": "Search exact text instead of regex (default: false)"},
+        "case_sensitive": {"type": bool, "description": "Match case exactly (default: false)"},
     },
     handler=search_files_handler,
     toolset="file",

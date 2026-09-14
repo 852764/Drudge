@@ -34,10 +34,18 @@ class ToolContext:
     save_tool_output: Callable[..., dict[str, Any]] | None = None
     read_tool_output: Callable[..., dict[str, Any]] | None = None
     max_output_bytes: int = 8 * 1024 * 1024
+    search_max_files: int = 10_000
+    search_max_file_bytes: int = 2 * 1024 * 1024
+    search_max_total_bytes: int = 32 * 1024 * 1024
+    search_max_entries: int = 50_000
 
     def __post_init__(self) -> None:
         if self.approval_mode not in tuple(mode.value for mode in ApprovalMode):
             raise ValueError("approval_mode must be auto, on_request, or never")
+        for name in ("search_max_files", "search_max_file_bytes", "search_max_total_bytes", "search_max_entries"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
 
     @classmethod
     def from_config(
@@ -64,6 +72,9 @@ class ToolContext:
             record_file_change=record_file_change,
             save_tool_output=save_tool_output,
             read_tool_output=read_tool_output,
+            **{name: security[name] for name in (
+                "search_max_files", "search_max_file_bytes", "search_max_total_bytes", "search_max_entries",
+            ) if name in security},
         )
 
     def allows_toolset(self, toolset: str) -> bool:

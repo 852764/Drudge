@@ -149,10 +149,14 @@ def limit_tool_result(
         "conflict", "checkpoint_created", "changed", "approval_required",
         "sha256", "before_sha256", "expected_sha256", "actual_sha256",
         "total_lines", "offset", "shown_lines", "replacements",
+        "complete", "files_scanned", "bytes_read", "entries_seen",
     ):
         item = payload.get(key, payload["metadata"].get(key))
         if item is not None and isinstance(item, (str, int, float, bool)):
             metadata[key] = item[:128] if isinstance(item, str) else item
+    reasons = payload.get("incomplete_reasons", payload["metadata"].get("incomplete_reasons"))
+    if isinstance(reasons, list):
+        metadata["incomplete_reasons"] = [reason[:80] for reason in reasons[:8] if isinstance(reason, str)]
     content = payload.get("content", "")
     if not isinstance(content, str):
         content = json.dumps(content, ensure_ascii=False)
@@ -167,7 +171,7 @@ def limit_tool_result(
     for key in reversed(list(metadata)):
         if len(json.dumps(result, ensure_ascii=False)) <= max_chars:
             break
-        if key not in {"truncated", "original_chars", "output_ref", "exit_code", "conflict", "checkpoint_created"}:
+        if key not in {"truncated", "original_chars", "output_ref", "exit_code", "conflict", "checkpoint_created", "complete"}:
             del metadata[key]
     if len(json.dumps(result, ensure_ascii=False)) > max_chars:
         result["error"] = "Tool reported an error; inspect full output if available." if error is not None else None
@@ -175,7 +179,7 @@ def limit_tool_result(
         minimal = {key: metadata[key] for key in ("truncated", "original_chars")}
         if ref:
             minimal["output_ref"] = {"id": ref["id"], "complete": ref.get("complete", False)}
-        for key in ("conflict", "checkpoint_created", "timed_out", "interrupted", "outcome_unknown"):
+        for key in ("conflict", "checkpoint_created", "timed_out", "interrupted", "outcome_unknown", "complete"):
             if isinstance(metadata.get(key), bool):
                 minimal[key] = metadata[key]
         exit_code = metadata.get("exit_code")

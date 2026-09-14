@@ -1,6 +1,6 @@
 # Drudge
 
-Drudge 是一个 Python 3.10+ 终端编程 Agent，当前版本为 **0.2.0b2 Beta**，面向有人审阅的本地开发工作流。发布范围及已知边界见[发布说明](docs/RELEASE.md)。
+Drudge 是一个 Python 3.10+ 终端编程 Agent，当前版本为 **0.2.0b3 Beta**，面向有人审阅的本地开发工作流。发布范围及已知边界见[发布说明](docs/RELEASE.md)。
 
 项目目标是逐步演进成类似 Codex 的本地开发助手。
 
@@ -18,6 +18,7 @@ Drudge 是一个 Python 3.10+ 终端编程 Agent，当前版本为 **0.2.0b2 Bet
 - 可恢复的计划、验收记录、并发修订冲突检测和 `/plan`
 - 默认交互审批、Windows Job Object 后代进程清理及离线发布检查
 - 批量读取、剩余轮次提示、完整的 `--no-tools` 禁用，以及可靠的单次查询退出码
+- 统一的 `.gitignore` 仓库发现、无静默 200 文件截断的搜索，以及明确的搜索完整性与行列定位
 
 ## 安装
 
@@ -111,3 +112,4 @@ python scripts/release_check.py
 - [持久化计划与验收记录](docs/PERSISTENT_PLANS.md)
 - [Beta 发布门槛与运维说明](docs/RELEASE.md)
 - [CodeGo 真实试用记录与本轮改进](docs/DOGFOOD_CODEGO.md)
+- [仓库搜索、忽略规则与扫描预算](docs/REPOSITORY_SEARCH.md)
