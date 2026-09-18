@@ -11,6 +11,13 @@ from typing import Any, Callable
 import httpx
 
 
+# These are the status codes that commonly represent a transient provider or
+# gateway condition.  Keep this policy shared by Chat Completions and
+# Responses so switching wire formats does not silently change reliability.
+TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+MAX_RETRY_DELAY_SECONDS = 60.0
+
+
 class LLMClient:
     """Small async client for Chat Completions with optional Responses fallback."""
 
@@ -43,6 +50,8 @@ class LLMClient:
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("model.timeout must be a positive finite number")
         self.timeout = timeout
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 1:
+            raise ValueError("model.max_retries must be a positive integer")
         self.max_retries = max_retries
         self.reasoning_effort = reasoning_effort
         self.disable_response_storage = disable_response_storage
@@ -123,16 +132,16 @@ class LLMClient:
                     }
                 except httpx.HTTPStatusError as error:
                     last_error = self._format_http_error(error, model, endpoint="chat/completions")
-                    if error.response.status_code in (429, 503):
-                        await asyncio.sleep(min(2 ** attempt, 30))
+                    if self._should_retry_status(error.response.status_code, attempt):
+                        await asyncio.sleep(self._retry_delay(error.response, attempt))
                         continue
                     if error.response.status_code == 404:
                         break
                     break
                 except (httpx.TimeoutException, httpx.ConnectError) as error:
-                    last_error = str(error)
+                    last_error = self._exception_text(error)
                     if attempt < self.max_retries - 1:
-                        await asyncio.sleep(min(2 ** attempt, 10))
+                        await asyncio.sleep(min(2 ** attempt, MAX_RETRY_DELAY_SECONDS))
                         continue
                     break
         raise RuntimeError(f"LLM request failed after {self.max_retries} attempts: {last_error}")
@@ -163,16 +172,16 @@ class LLMClient:
                     return self._responses_to_chat_response(data, model)
                 except httpx.HTTPStatusError as error:
                     last_error = self._format_http_error(error, model, endpoint="responses")
-                    if error.response.status_code in (429, 503):
-                        await asyncio.sleep(min(2 ** attempt, 30))
+                    if self._should_retry_status(error.response.status_code, attempt):
+                        await asyncio.sleep(self._retry_delay(error.response, attempt))
                         continue
                     if error.response.status_code == 404:
                         break
                     break
                 except (httpx.TimeoutException, httpx.ConnectError) as error:
-                    last_error = str(error)
+                    last_error = self._exception_text(error)
                     if attempt < self.max_retries - 1:
-                        await asyncio.sleep(min(2 ** attempt, 10))
+                        await asyncio.sleep(min(2 ** attempt, MAX_RETRY_DELAY_SECONDS))
                         continue
                     break
         raise RuntimeError(f"Responses request failed after {self.max_retries} attempts: {last_error}")
@@ -280,15 +289,15 @@ class LLMClient:
                     raise RuntimeError(f"Invalid SSE payload from chat/completions: {error}") from error
                 except httpx.HTTPStatusError as error:
                     last_error = self._format_http_error(error, model, endpoint="chat/completions")
-                    if error.response.status_code in (429, 503) and attempt < self.max_retries - 1:
-                        await asyncio.sleep(min(2 ** attempt, 30))
+                    if self._should_retry_status(error.response.status_code, attempt):
+                        await asyncio.sleep(self._retry_delay(error.response, attempt))
                         continue
                     break
                 except (httpx.TimeoutException, httpx.ConnectError) as error:
-                    last_error = str(error)
+                    last_error = self._exception_text(error)
                     if text_parts or tool_parts:
                         raise RuntimeError(
-                            f"Chat stream interrupted after partial output: {error}"
+                            f"Chat stream interrupted after partial output: {self._exception_text(error)}"
                         ) from error
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(min(2 ** attempt, 10))
@@ -383,15 +392,15 @@ class LLMClient:
                     raise RuntimeError(f"Invalid SSE payload from responses: {error}") from error
                 except httpx.HTTPStatusError as error:
                     last_error = self._format_http_error(error, model, endpoint="responses")
-                    if error.response.status_code in (429, 503) and attempt < self.max_retries - 1:
-                        await asyncio.sleep(min(2 ** attempt, 30))
+                    if self._should_retry_status(error.response.status_code, attempt):
+                        await asyncio.sleep(self._retry_delay(error.response, attempt))
                         continue
                     break
                 except (httpx.TimeoutException, httpx.ConnectError) as error:
-                    last_error = str(error)
+                    last_error = self._exception_text(error)
                     if text_parts or output_items:
                         raise RuntimeError(
-                            f"Responses stream interrupted after partial output: {error}"
+                            f"Responses stream interrupted after partial output: {self._exception_text(error)}"
                         ) from error
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(min(2 ** attempt, 10))
@@ -410,6 +419,31 @@ class LLMClient:
             )
             response.raise_for_status()
             return response.json()
+
+    def _should_retry_status(self, status_code: int, attempt: int) -> bool:
+        return status_code in TRANSIENT_HTTP_STATUS_CODES and attempt < self.max_retries - 1
+
+    @classmethod
+    def _retry_delay(cls, response: httpx.Response, attempt: int) -> float:
+        """Return a bounded Retry-After or exponential delay.
+
+        The caller still checks the attempt count; keeping that check here
+        makes every request path use the same provider-friendly backoff.
+        HTTP-date Retry-After values are intentionally ignored because a
+        local proxy clock can be skewed; malformed values fall back safely.
+        """
+        retry_after = response.headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(0.0, min(float(retry_after), MAX_RETRY_DELAY_SECONDS))
+            except (TypeError, ValueError):
+                pass
+        return min(2 ** attempt, MAX_RETRY_DELAY_SECONDS)
+
+    @staticmethod
+    def _exception_text(error: BaseException) -> str:
+        text = str(error).strip()
+        return text or type(error).__name__
 
     async def list_models(self) -> list[str]:
         url = f"{self.base_url}/models"

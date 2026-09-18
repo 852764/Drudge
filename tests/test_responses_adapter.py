@@ -4,6 +4,9 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
+
+import httpx
 
 from agent import Agent, RunStatus
 from agent.llm import LLMClient
@@ -39,7 +42,56 @@ class QueueResponsesClient(CapturingResponsesClient):
         return self.responses.pop(0)
 
 
+class RetryClient(LLMClient):
+    def __init__(self, api_type: str, failures: list[int], success: dict):
+        super().__init__(
+            base_url="https://example.invalid/v1",
+            api_key="test",
+            model="fake",
+            api_type=api_type,
+            max_retries=len(failures) + 1,
+        )
+        self.failures = list(failures)
+        self.success = success
+
+    async def _post_json(self, url: str, body: dict) -> dict:
+        if self.failures:
+            status = self.failures.pop(0)
+            request = httpx.Request("POST", url)
+            headers = {"Retry-After": "7"} if status == 429 else {}
+            response = httpx.Response(status, request=request, headers=headers, text="temporary")
+            raise httpx.HTTPStatusError("temporary", request=request, response=response)
+        return self.success
+
+
 class ResponsesAdapterTests(unittest.TestCase):
+    def test_transient_http_statuses_retry_for_both_wire_formats(self):
+        cases = {
+            "chat": {
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            },
+            "responses": {"status": "completed", "output": []},
+        }
+        for api_type, success in cases.items():
+            with self.subTest(api_type=api_type):
+                client = RetryClient(api_type, [500, 429], success)
+                with patch("agent.llm.asyncio.sleep", new=AsyncMock()) as sleep:
+                    result = asyncio.run(client.chat([{"role": "user", "content": "retry"}]))
+                self.assertEqual(len(client.failures), 0)
+                self.assertEqual(sleep.await_args_list[0].args, (1,))
+                self.assertEqual(sleep.await_args_list[1].args, (7.0,))
+                self.assertEqual(LLMClient.extract_text(result), "ok" if api_type == "chat" else "")
+
+    def test_retry_after_is_bounded_and_max_retries_is_validated(self):
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            LLMClient("https://example.invalid/v1", "test", "fake", max_retries=0)
+        self.assertEqual(
+            LLMClient._retry_delay(
+                httpx.Response(429, headers={"Retry-After": "999"}), 0
+            ),
+            60.0,
+        )
+
     def test_responses_options_include_reasoning_and_store_flag(self):
         client = CapturingResponsesClient({
             "id": "resp-1",
