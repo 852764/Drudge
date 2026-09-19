@@ -52,7 +52,7 @@ agent:
   context_summary_fallback: true
 ```
 
-- 估算上下文超过模型窗口的 80% 时，Agent 自动压缩。
+- 估算上下文超过模型窗口的 80% 时，Agent 自动压缩。估算器按实际 wire 字段计算，包括消息 framing、列表/多模态内容、tool_calls 和 Responses provider_items；它是保守的跨供应商估算，不依赖特定 tokenizer。
 - /compact 可以手动触发同一套流程。
 - 系统消息和最近 8 条非系统消息保留原文。
 - 如果保留区从工具结果开始，会向前扩展到对应 assistant tool call，避免拆断工具事务。

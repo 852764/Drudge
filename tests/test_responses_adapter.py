@@ -92,6 +92,17 @@ class ResponsesAdapterTests(unittest.TestCase):
             60.0,
         )
 
+    def test_context_estimator_counts_framing_and_responses_items(self):
+        short = LLMClient.estimate_tokens([{"role": "user", "content": "x"}])
+        rich = LLMClient.estimate_tokens([{
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hello"}],
+            "provider_items": [{"type": "function_call", "name": "read_file", "arguments": "{}"}],
+        }])
+
+        self.assertGreater(short, 0)
+        self.assertGreater(rich, short)
+
     def test_responses_options_include_reasoning_and_store_flag(self):
         client = CapturingResponsesClient({
             "id": "resp-1",

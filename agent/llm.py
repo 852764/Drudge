@@ -624,15 +624,37 @@ class LLMClient:
 
     @staticmethod
     def estimate_tokens(messages: list[dict]) -> int:
+        """Return a conservative, provider-independent context estimate.
+
+        Exact tokenizers differ between providers and are not available for
+        arbitrary local gateways.  The previous estimator ignored message
+        overhead, multimodal/list content, and Responses ``provider_items``;
+        short prompts could therefore report zero and delay compaction until
+        the provider rejected an oversized request.  JSON sizing with a small
+        per-message framing allowance is intentionally conservative while
+        remaining deterministic and offline.
+        """
         total = 0
-        for msg in messages:
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                total += len(content) // 4
-            if msg.get("tool_calls"):
-                for tool_call in msg["tool_calls"]:
-                    func = tool_call.get("function", {})
-                    total += len(str(func)) // 4
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            wire = {
+                key: message[key]
+                for key in ("role", "content", "name", "tool_call_id", "tool_calls", "provider_items")
+                if key in message and message[key] not in (None, "", [], {})
+            }
+            try:
+                serialized = json.dumps(
+                    wire,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            except (TypeError, ValueError):
+                serialized = str(wire)
+            # Four characters/token is a deliberately provider-neutral lower
+            # bound; add framing so even tiny messages consume context budget.
+            total += 4 + max(1, (len(serialized) + 3) // 4)
         return total
 
 
