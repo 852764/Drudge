@@ -67,6 +67,25 @@ class FileEditingTests(unittest.TestCase):
                 self.assertEqual(result["sha256"], digest(b"new\n"))
                 self.assertEqual(result["before_sha256"], digest(b"old\n"))
 
+    def test_revision_uses_context_display_path(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            shown_root = Path(workspace).absolute()
+            target = shown_root / "sample.txt"
+            target.write_text("old", encoding="utf-8")
+            changes = []
+            context = ToolContext.from_config(
+                {"workspace_root": workspace, "approval_mode": "auto"},
+                ["file"],
+                record_file_change=changes.append,
+            )
+
+            result = json.loads(registry.dispatch(
+                "write_file", {"path": "sample.txt", "content": "new"}, context=context,
+            ))
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(changes[0]["path"], str(target))
+
     def test_stale_guard_blocks_all_edits_without_checkpoint(self):
         self.path.write_bytes(b"user change")
         for name in ("write_file", "patch", "apply_patch"):

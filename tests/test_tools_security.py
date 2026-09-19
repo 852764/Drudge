@@ -7,9 +7,27 @@ import unittest
 from pathlib import Path
 
 from tools import ToolContext, registry
+from tools.context import is_within_path
 
 
 class ToolSecurityTests(unittest.TestCase):
+    def test_workspace_boundary_rejects_sibling_prefix_collision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            workspace = base / "repo"
+            sibling = base / "repo-sibling"
+            workspace.mkdir()
+            sibling.mkdir()
+            target = sibling / "outside.txt"
+            target.write_text("outside", encoding="utf-8")
+            context = ToolContext.from_config({"workspace_root": str(workspace)}, ["file"])
+
+            self.assertTrue(is_within_path(workspace, workspace))
+            self.assertFalse(is_within_path(sibling, workspace))
+            payload = json.loads(registry.dispatch("read_file", {"path": str(target)}, context=context))
+            self.assertTrue(payload["blocked"])
+            self.assertIn("outside workspace", payload["error"].lower())
+
     def test_default_context_blocks_unapproved_mutation(self):
         with tempfile.TemporaryDirectory() as workspace:
             for context in (
