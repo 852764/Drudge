@@ -10,6 +10,8 @@ from typing import Any, Callable
 
 import httpx
 
+from .model_errors import ContextWindowExceeded, context_window_error
+
 
 # These are the status codes that commonly represent a transient provider or
 # gateway condition.  Keep this policy shared by Chat Completions and
@@ -82,6 +84,8 @@ class LLMClient:
                         )
                     return await self._responses(messages, tools, tool_choice)
                 raise RuntimeError(f"Unsupported model.api: {api_type}")
+            except ContextWindowExceeded:
+                raise
             except RuntimeError as error:
                 last_error = str(error)
                 if self.api_type == "auto" and api_type == "chat" and "HTTP 404" in last_error:
@@ -131,6 +135,9 @@ class LLMClient:
                         "usage": data.get("usage", {}),
                     }
                 except httpx.HTTPStatusError as error:
+                    overflow = context_window_error(error.response)
+                    if overflow:
+                        raise overflow from error
                     last_error = self._format_http_error(error, model, endpoint="chat/completions")
                     if self._should_retry_status(error.response.status_code, attempt):
                         await asyncio.sleep(self._retry_delay(error.response, attempt))
@@ -171,6 +178,9 @@ class LLMClient:
                     data = await self._post_json(url, body)
                     return self._responses_to_chat_response(data, model)
                 except httpx.HTTPStatusError as error:
+                    overflow = context_window_error(error.response)
+                    if overflow:
+                        raise overflow from error
                     last_error = self._format_http_error(error, model, endpoint="responses")
                     if self._should_retry_status(error.response.status_code, attempt):
                         await asyncio.sleep(self._retry_delay(error.response, attempt))
@@ -288,6 +298,9 @@ class LLMClient:
                 except json.JSONDecodeError as error:
                     raise RuntimeError(f"Invalid SSE payload from chat/completions: {error}") from error
                 except httpx.HTTPStatusError as error:
+                    overflow = context_window_error(error.response)
+                    if overflow and not (text_parts or tool_parts):
+                        raise overflow from error
                     last_error = self._format_http_error(error, model, endpoint="chat/completions")
                     if self._should_retry_status(error.response.status_code, attempt):
                         await asyncio.sleep(self._retry_delay(error.response, attempt))
@@ -391,6 +404,9 @@ class LLMClient:
                 except json.JSONDecodeError as error:
                     raise RuntimeError(f"Invalid SSE payload from responses: {error}") from error
                 except httpx.HTTPStatusError as error:
+                    overflow = context_window_error(error.response)
+                    if overflow and not (text_parts or output_items):
+                        raise overflow from error
                     last_error = self._format_http_error(error, model, endpoint="responses")
                     if self._should_retry_status(error.response.status_code, attempt):
                         await asyncio.sleep(self._retry_delay(error.response, attempt))

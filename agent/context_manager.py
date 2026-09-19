@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from tools.repository import RepositoryWalker, DEFAULT_EXCLUDE_DIRS
 
 
@@ -62,6 +62,7 @@ def partition_messages_for_compaction(
     messages: list[dict[str, Any]],
     *,
     keep_recent: int = 8,
+    preserve_latest_turn: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Split messages while keeping recent tool-call transactions intact."""
     if keep_recent < 1:
@@ -72,6 +73,13 @@ def partition_messages_for_compaction(
         return system_messages[:1], [], later_messages
 
     recent_start = max(0, len(later_messages) - keep_recent)
+    if preserve_latest_turn:
+        latest_user = next(
+            (i for i in range(len(later_messages) - 1, -1, -1)
+             if later_messages[i].get("role") == "user"),
+            0,
+        )
+        recent_start = min(recent_start, latest_user)
     while recent_start > 0 and later_messages[recent_start].get("role") == "tool":
         recent_start -= 1
     old_messages = later_messages[:recent_start]
@@ -92,6 +100,56 @@ def build_compacted_messages(
         "Use this summary as context, but prefer current user instructions and recent tool results.",
     }
     return system_messages[:1] + [summary_msg] + list(recent_messages)
+
+
+def fit_compaction_summary(
+    system_messages: list[dict[str, Any]],
+    summary: str,
+    recent_messages: list[dict[str, Any]],
+    *,
+    max_tokens: int,
+    estimate_tokens: Callable[[list[dict[str, Any]]], int],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Bound only the summary body; never clip instructions or recent turns.
+
+    Keep the summary framing intact and explicitly mark omitted material.
+    If protected context alone exceeds the target, return a minimal summary;
+    the caller must check actual reduction before committing or retrying.
+    Token counts are heuristic, not a guarantee of provider acceptance.
+    """
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+        raise ValueError("max_tokens must be a positive integer")
+    messages = build_compacted_messages(system_messages, summary, recent_messages)
+    if estimate_tokens(messages) <= max_tokens:
+        return messages, False
+
+    notice = "\n[Summary truncated for context budget; earlier details may be missing.]\n"
+
+    def candidate(length: int) -> list[dict[str, Any]]:
+        head = (length + 1) // 2
+        tail = length // 2
+        edges = summary[:head] + (summary[-tail:] if tail else "")
+        with_notice = build_compacted_messages(
+            system_messages, edges + notice, recent_messages,
+        )
+        if estimate_tokens(with_notice) <= max_tokens:
+            return with_notice
+        # Under a very tight budget the marker itself may not fit. Keep the
+        # framing and protected latest turn rather than returning an oversized
+        # request merely to preserve explanatory text.
+        return build_compacted_messages(system_messages, edges, recent_messages)
+
+    best = candidate(0)
+    low, high = 1, len(summary)
+    while low <= high:
+        middle = (low + high) // 2
+        proposed = candidate(middle)
+        if estimate_tokens(proposed) <= max_tokens:
+            best = proposed
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best, True
 
 
 def build_context_summary_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:

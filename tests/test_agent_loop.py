@@ -9,6 +9,7 @@ from pathlib import Path
 
 from agent import Agent, RunStatus
 from agent.llm import LLMClient
+from agent.model_errors import ContextWindowExceeded
 from config import ConfigManager
 from tests.fakes import FakeLLM, chat_response, function_call
 
@@ -433,7 +434,7 @@ class AgentLoopTests(unittest.TestCase):
             config.override("agent", "compact_keep_recent", value=3)
             config.override("agent", "context_summary_mode", value="deterministic")
             fake = FakeLLM([
-                RuntimeError("HTTP 400: context_length_exceeded; maximum context length reached"),
+                ContextWindowExceeded(status_code=400),
                 chat_response("recovered after provider overflow"),
             ])
             agent = Agent(config)

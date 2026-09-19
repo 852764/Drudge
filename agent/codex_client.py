@@ -10,6 +10,7 @@ import httpx
 
 from .codex_auth import CODEX_BASE_URL, resolve_runtime_credentials
 from .llm import LLMClient
+from .model_errors import context_window_error
 from utils import format_exception
 
 
@@ -147,6 +148,9 @@ class CodexOAuthClient(LLMClient):
                 ) as response:
                     if response.status_code >= 400:
                         raw = (await response.aread()).decode("utf-8", errors="replace")[:1000]
+                        overflow = context_window_error(response)
+                        if overflow:
+                            raise overflow
                         raise CodexProviderError(
                             f"Codex backend HTTP {response.status_code}: {raw}",
                             status_code=response.status_code,

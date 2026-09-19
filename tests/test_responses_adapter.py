@@ -10,6 +10,7 @@ import httpx
 
 from agent import Agent, RunStatus
 from agent.llm import LLMClient
+from agent.model_errors import ContextWindowExceeded, context_window_error
 from config import ConfigManager
 from tools import registry
 
@@ -64,6 +65,17 @@ class RetryClient(LLMClient):
         return self.success
 
 
+class StructuredOverflowClient(LLMClient):
+    async def _post_json(self, url: str, body: dict) -> dict:
+        request = httpx.Request("POST", url)
+        response = httpx.Response(
+            400,
+            request=request,
+            json={"error": {"code": "context_length_exceeded", "message": "too large"}},
+        )
+        raise httpx.HTTPStatusError("bad request", request=request, response=response)
+
+
 class ResponsesAdapterTests(unittest.TestCase):
     def test_transient_http_statuses_retry_for_both_wire_formats(self):
         cases = {
@@ -102,6 +114,33 @@ class ResponsesAdapterTests(unittest.TestCase):
 
         self.assertGreater(short, 0)
         self.assertGreater(rich, short)
+
+    def test_context_overflow_requires_structured_provider_error(self):
+        request = httpx.Request("POST", "https://example.invalid/v1/responses")
+        structured = httpx.Response(
+            400,
+            request=request,
+            json={"error": {"code": "context_length_exceeded", "message": "too large"}},
+        )
+        plain_413 = httpx.Response(413, request=request, text="payload too large")
+
+        overflow = context_window_error(structured)
+
+        self.assertIsInstance(overflow, ContextWindowExceeded)
+        self.assertIsNone(context_window_error(plain_413))
+
+    def test_both_wire_formats_surface_typed_context_overflow(self):
+        for api_type in ("chat", "responses"):
+            with self.subTest(api_type=api_type):
+                client = StructuredOverflowClient(
+                    base_url="https://example.invalid/v1",
+                    api_key="test",
+                    model="fake",
+                    api_type=api_type,
+                    max_retries=1,
+                )
+                with self.assertRaises(ContextWindowExceeded):
+                    asyncio.run(client.chat([{"role": "user", "content": "x"}]))
 
     def test_responses_options_include_reasoning_and_store_flag(self):
         client = CapturingResponsesClient({

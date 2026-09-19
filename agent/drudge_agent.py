@@ -10,6 +10,7 @@ from time import monotonic
 from typing import Any, Awaitable, Callable
 
 from .llm import LLMClient, create_client
+from .model_errors import ContextWindowExceeded
 from .output_filter import (
     DegenerateReasoningError,
     FilteredText,
@@ -25,6 +26,7 @@ from .context_manager import (
     build_repo_map,
     partition_messages_for_compaction,
     summarize_messages,
+    fit_compaction_summary,
 )
 from .refusal import build_refusal_review_messages, is_refusal
 from .storage import ConversationStore
@@ -370,49 +372,55 @@ class Agent:
     ) -> tuple[dict, str | None, list[dict], bool, bool, int]:
         """Retry one failed model call after a provider context-overflow error.
 
-        Local estimates are deliberately conservative, but gateways can use a
-        different tokenizer or count hidden protocol fields.  A single
+        Local estimates are heuristic; gateways can use a different tokenizer
+        or count hidden protocol fields. A single
         host-controlled compaction retry handles that final boundary without
         retrying arbitrary 4xx errors or ever replaying a tool call.
         """
+        streamed = False
+
+        async def forward(delta: str) -> None:
+            nonlocal streamed
+            streamed = True
+            await self._emit(stream_callback, delta)
+
         try:
-            return await self._call_model_filtered(tool_schemas, stream_callback)
-        except Exception as error:
-            if not self._is_context_overflow_error(error):
+            return await self._call_model_filtered(tool_schemas, forward if stream_callback else None)
+        except ContextWindowExceeded as error:
+            # Defense in depth for injected/custom clients. Built-in clients
+            # only raise the typed error for pre-output HTTP rejections.
+            if streamed:
                 raise
+            if self._cancel_event.is_set():
+                raise asyncio.CancelledError
             before = LLMClient.estimate_tokens(self._messages)
-            details = await self._compress_context()
+            context_limit = int(self.config.get("model", "context_length", default=0) or 0)
+            # A misconfigured model window must not permit an unchanged retry.
+            ceiling = min(before, context_limit) if context_limit > 0 else before
+            target_tokens = max(1, int(ceiling * 0.70))
+            details = await self._compress_context(target_tokens=target_tokens)
             after = LLMClient.estimate_tokens(self._messages)
+            reduced = after < before
             self._trace_event(
                 "context_overflow_recovery",
                 {
-                    "error": format_exception(error),
+                    "status_code": error.status_code,
                     "before_tokens": before,
                     "after_tokens": after,
+                    "target_tokens": target_tokens,
+                    "retry": reduced,
                     "compaction": details,
                 },
             )
+            if self._cancel_event.is_set():
+                raise asyncio.CancelledError
+            if not reduced:
+                raise RuntimeError(
+                    "Context overflow recovery did not reduce the request; no retry was sent. "
+                    "The latest user turn and instructions were kept intact. "
+                    "Shorten the input, reduce tool schemas, or start /new with a smaller task."
+                ) from error
             return await self._call_model_filtered(tool_schemas, stream_callback)
-
-    @staticmethod
-    def _is_context_overflow_error(error: BaseException) -> bool:
-        """Recognize provider-specific context overflow wording, not all 400s."""
-        response = getattr(error, "response", None)
-        if response is not None and getattr(response, "status_code", None) == 413:
-            return True
-        text = format_exception(error).lower()
-        if "http 413" in text or "status code 413" in text:
-            return True
-        markers = (
-            "context_length_exceeded",
-            "context window exceeded",
-            "maximum context length",
-            "context limit exceeded",
-            "prompt is too long",
-            "input is too long",
-            "too many tokens",
-        )
-        return any(marker in text for marker in markers)
 
     def _budgeted_model_messages(self) -> list[dict]:
         """Add host turn guidance to the request, never to durable user history."""
@@ -1846,12 +1854,19 @@ class Agent:
             raise
         return reviewed
 
-    async def _compress_context(self) -> dict[str, Any]:
+    async def _compress_context(self, *, target_tokens: int | None = None) -> dict[str, Any]:
         """Compact old context with an LLM summary and a deterministic fallback."""
         keep_recent = int(self.config.get("agent", "compact_keep_recent", default=8))
+        if target_tokens is not None:
+            if isinstance(target_tokens, bool) or not isinstance(target_tokens, int) or target_tokens < 1:
+                raise ValueError("target_tokens must be a positive integer")
+            # Emergency compaction summarizes all earlier turns, even when the
+            # usual keep_recent count would prevent any reduction.
+            keep_recent = 1
         system_messages, old_messages, recent_messages = partition_messages_for_compaction(
             self._messages,
             keep_recent=keep_recent,
+            preserve_latest_turn=target_tokens is not None,
         )
         if not old_messages:
             result = {
@@ -1929,12 +1944,35 @@ class Agent:
                 summary,
                 recent_messages,
             )
+            summary_truncated = False
+            if target_tokens is not None:
+                compacted_messages, summary_truncated = fit_compaction_summary(
+                    system_messages, summary, recent_messages,
+                    max_tokens=target_tokens,
+                    estimate_tokens=LLMClient.estimate_tokens,
+                )
             result = {
                 "mode": mode,
                 "summarized_messages": len(old_messages),
                 "summary_tokens": summary_tokens,
                 "summary_model": summary_model,
             }
+            if target_tokens is not None:
+                before = LLMClient.estimate_tokens(self._messages)
+                after = LLMClient.estimate_tokens(compacted_messages)
+                result.update({
+                    "target_tokens": target_tokens,
+                    "before_tokens": before,
+                    "after_tokens": after,
+                    "target_met": after <= target_tokens,
+                    "summary_truncated": summary_truncated,
+                })
+                if after >= before:
+                    # No checkpoint or in-memory mutation for a failed attempt.
+                    result["mode"] = "not_reduced"
+                    result["summarized_messages"] = 0
+                    self._last_compaction = result
+                    return result
             if error:
                 result["fallback_reason"] = error
             checkpoint = self._save_context_checkpoint(

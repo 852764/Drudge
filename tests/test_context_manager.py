@@ -8,9 +8,11 @@ from agent.context_manager import (
     build_context_summary_messages,
     build_repo_map,
     compact_messages,
+    fit_compaction_summary,
     partition_messages_for_compaction,
     summarize_messages,
 )
+from agent.llm import LLMClient
 
 
 class ContextManagerTests(unittest.TestCase):
@@ -116,6 +118,33 @@ class ContextManagerTests(unittest.TestCase):
         for count in (0, -1):
             with self.assertRaisesRegex(ValueError, "at least 1"):
                 partition_messages_for_compaction([{"role": "user", "content": "latest"}], keep_recent=count)
+
+    def test_fit_compaction_summary_preserves_latest_tool_transaction(self):
+        system = [{"role": "system", "content": "instructions"}]
+        summary = "historical detail " * 500
+        recent = [
+            {"role": "user", "content": "latest request"},
+            {"role": "assistant", "content": "checking", "tool_calls": [{
+                "id": "call-1", "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "latest file result"},
+        ]
+        protected = LLMClient.estimate_tokens(system + recent)
+
+        fitted, truncated = fit_compaction_summary(
+            system,
+            summary,
+            recent,
+            max_tokens=protected + 80,
+            estimate_tokens=LLMClient.estimate_tokens,
+        )
+
+        self.assertTrue(truncated)
+        self.assertLessEqual(LLMClient.estimate_tokens(fitted), protected + 80)
+        self.assertEqual([item["role"] for item in fitted[-3:]], ["user", "assistant", "tool"])
+        self.assertEqual(fitted[-1]["tool_call_id"], "call-1")
+        self.assertLess(len(fitted[1]["content"]), len(summary))
 
 
 if __name__ == "__main__":
