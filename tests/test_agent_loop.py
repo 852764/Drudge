@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from agent import Agent, RunStatus
+from agent.llm import LLMClient
 from config import ConfigManager
 from tests.fakes import FakeLLM, chat_response, function_call
 
@@ -425,6 +426,42 @@ class AgentLoopTests(unittest.TestCase):
                 fake.requests[1]["messages"][1]["content"],
             )
             self.assertEqual(agent.get_status()["last_compaction"]["mode"], "llm")
+
+    def test_provider_context_overflow_compacts_and_retries_once(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            config = test_config(workspace)
+            config.override("agent", "compact_keep_recent", value=3)
+            config.override("agent", "context_summary_mode", value="deterministic")
+            fake = FakeLLM([
+                RuntimeError("HTTP 400: context_length_exceeded; maximum context length reached"),
+                chat_response("recovered after provider overflow"),
+            ])
+            agent = Agent(config)
+            agent.llm = fake
+            agent._messages = [{"role": "system", "content": "old system"}] + [
+                {"role": "user", "content": f"old message {index}"}
+                for index in range(10)
+            ]
+
+            result = asyncio.run(agent.run("current question"))
+
+            self.assertEqual(result, "recovered after provider overflow")
+            self.assertEqual(len(fake.requests), 2)
+            self.assertEqual(agent.get_status()["last_compaction"]["mode"], "fallback")
+            self.assertLess(
+                LLMClient.estimate_tokens(fake.requests[1]["messages"]),
+                LLMClient.estimate_tokens(fake.requests[0]["messages"]),
+            )
+
+    def test_generic_http_400_is_not_retried_as_context_overflow(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            agent = Agent(test_config(workspace))
+            agent.llm = FakeLLM([RuntimeError("HTTP 400: invalid tool schema")])
+
+            result = asyncio.run(agent.run("question"))
+
+            self.assertIn("invalid tool schema", result)
+            self.assertEqual(len(agent.llm.requests), 1)
 
     def test_configured_utility_model_handles_summary_only(self):
         with tempfile.TemporaryDirectory() as workspace:

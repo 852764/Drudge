@@ -363,6 +363,57 @@ class Agent:
             return last_result
         raise RuntimeError("Model reasoning recovery failed without a response")
 
+    async def _call_model_with_context_recovery(
+        self,
+        tool_schemas: list[dict],
+        stream_callback: Any,
+    ) -> tuple[dict, str | None, list[dict], bool, bool, int]:
+        """Retry one failed model call after a provider context-overflow error.
+
+        Local estimates are deliberately conservative, but gateways can use a
+        different tokenizer or count hidden protocol fields.  A single
+        host-controlled compaction retry handles that final boundary without
+        retrying arbitrary 4xx errors or ever replaying a tool call.
+        """
+        try:
+            return await self._call_model_filtered(tool_schemas, stream_callback)
+        except Exception as error:
+            if not self._is_context_overflow_error(error):
+                raise
+            before = LLMClient.estimate_tokens(self._messages)
+            details = await self._compress_context()
+            after = LLMClient.estimate_tokens(self._messages)
+            self._trace_event(
+                "context_overflow_recovery",
+                {
+                    "error": format_exception(error),
+                    "before_tokens": before,
+                    "after_tokens": after,
+                    "compaction": details,
+                },
+            )
+            return await self._call_model_filtered(tool_schemas, stream_callback)
+
+    @staticmethod
+    def _is_context_overflow_error(error: BaseException) -> bool:
+        """Recognize provider-specific context overflow wording, not all 400s."""
+        response = getattr(error, "response", None)
+        if response is not None and getattr(response, "status_code", None) == 413:
+            return True
+        text = format_exception(error).lower()
+        if "http 413" in text or "status code 413" in text:
+            return True
+        markers = (
+            "context_length_exceeded",
+            "context window exceeded",
+            "maximum context length",
+            "context limit exceeded",
+            "prompt is too long",
+            "input is too long",
+            "too many tokens",
+        )
+        return any(marker in text for marker in markers)
+
     def _budgeted_model_messages(self) -> list[dict]:
         """Add host turn guidance to the request, never to durable user history."""
         maximum = int(self.config.get("agent", "max_turns", default=50))
@@ -1594,7 +1645,7 @@ class Agent:
                     turn_streamed,
                     reasoning_only,
                     attempt_tokens,
-                ) = await self._call_model_filtered(
+                ) = await self._call_model_with_context_recovery(
                     tool_schemas,
                     stream_callback,
                 )
