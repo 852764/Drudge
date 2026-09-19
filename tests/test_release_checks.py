@@ -71,7 +71,7 @@ class ReleaseCheckTests(unittest.TestCase):
 
     def test_ci_covers_minimum_python_windows_and_unix(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        for required in ("'3.10'", "windows-latest", "ubuntu-latest", "macos-latest", "scripts/release_check.py", "contents: read"):
+        for required in ("'3.10'", "windows-latest", "ubuntu-latest", "macos-latest", "scripts/ci_unittest.py", "scripts/release_check.py", "build/ci/**", "contents: read"):
             self.assertIn(required, workflow)
 
     def test_failure_excerpt_surfaces_cross_platform_test_diagnostics(self):
