@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from tools.context import is_sensitive_path
+from tools.context import display_path, is_sensitive_path, is_within_path
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,16 +23,20 @@ def load_project_instructions(
     max_chars: int = 64_000,
 ) -> list[ProjectInstruction]:
     """Load root-to-leaf instruction files without escaping the workspace."""
-    root = Path(workspace).expanduser().resolve()
-    active = Path(cwd).expanduser().resolve() if cwd else root
-    if active != root and root not in active.parents:
+    root = display_path(workspace)
+    secure_root = root.resolve()
+    active = display_path(cwd) if cwd else root
+    secure_active = active.resolve()
+    if not is_within_path(secure_active, secure_root):
         active = root
-    if active.is_file():
+        secure_active = secure_root
+    if secure_active.is_file():
         active = active.parent
+        secure_active = secure_active.parent
 
     directories = [root]
     if active != root:
-        relative = active.relative_to(root)
+        relative = secure_active.relative_to(secure_root)
         current = root
         for part in relative.parts:
             current = current / part
@@ -49,7 +53,7 @@ def load_project_instructions(
         resolved = candidate.resolve()
         if is_sensitive_path(resolved):
             continue
-        if resolved != root and root not in resolved.parents:
+        if not is_within_path(resolved, secure_root):
             continue
         try:
             with resolved.open(encoding="utf-8") as stream:
@@ -59,13 +63,13 @@ def load_project_instructions(
         content = content[:remaining].strip()
         if not content:
             continue
-        loaded.append(ProjectInstruction(resolved, directory, content))
+        loaded.append(ProjectInstruction(candidate, directory, content))
         remaining -= len(content)
     return loaded
 
 
 def render_project_instructions(items: list[ProjectInstruction], workspace: str | Path) -> str:
-    root = Path(workspace).expanduser().resolve()
+    root = display_path(workspace)
     sections = []
     for item in items:
         try:

@@ -32,6 +32,7 @@ def _record_file_change(
     context: ToolContext | None,
     *,
     path: Path,
+    display_path: Path | None = None,
     operation: str,
     before_content: str | None,
     after_content: str | None,
@@ -40,7 +41,7 @@ def _record_file_change(
     if context is None or context.record_file_change is None:
         return False
     context.record_file_change({
-        "path": str(path),
+        "path": str(display_path or path),
         "operation": operation,
         "before_content": before_content,
         "after_content": after_content,
@@ -56,6 +57,7 @@ def _commit_text_change(
     context: ToolContext,
     *,
     operation: str,
+    display_path: Path | None = None,
 ) -> dict:
     after = content.encode("utf-8")
     before_text = before.decode("utf-8") if before is not None else None
@@ -63,7 +65,7 @@ def _commit_text_change(
     diff_summary = _diff_summary(path, before_text, content)
     result = {
         "success": True,
-        "path": str(path),
+        "path": str(display_path or path),
         "changed": changed,
         "sha256": sha256(after),
         "before_sha256": sha256(before),
@@ -75,7 +77,7 @@ def _commit_text_change(
     atomic_write(path, after, expected=before)
     try:
         result["checkpoint_created"] = _record_file_change(
-            context, path=path, operation=operation,
+            context, path=path, display_path=display_path, operation=operation,
             before_content=before_text, after_content=content,
             diff_summary=diff_summary,
         )
@@ -171,19 +173,23 @@ def write_file_handler(
     expected_sha256: str | None = None,
 ) -> dict | ToolResult:
     """写入文件内容（覆盖）"""
+    if context is None:
+        return ToolResult.failure("ToolContext is required", blocked=True)
+    shown_path = context.display_path(path)
     try:
         filepath = _resolve_path(path, context)
     except PermissionError as e:
         return ToolResult.failure(str(e), blocked=True)
-    if context is None:
-        return ToolResult.failure("ToolContext is required", blocked=True)
     allowed, reason = context.mutation_allowed(f"write_file {filepath}")
     if not allowed:
         return ToolResult.failure(reason or "Write blocked", blocked=True)
     try:
         before = read_bytes(filepath)
         check_expected_hash(filepath, before, expected_sha256)
-        result = _commit_text_change(filepath, before, content, context, operation="write_file")
+        result = _commit_text_change(
+            filepath, before, content, context,
+            operation="write_file", display_path=shown_path,
+        )
         result["size"] = len(content)
         return result
     except Exception as e:
@@ -321,12 +327,13 @@ def patch_handler(
     expected_sha256: str | None = None,
 ) -> str | dict | ToolResult:
     """在文件中查找替换"""
+    if context is None:
+        return ToolResult.failure("ToolContext is required", blocked=True)
+    shown_path = context.display_path(path)
     try:
         filepath = _resolve_path(path, context)
     except PermissionError as e:
         return ToolResult.failure(str(e), blocked=True)
-    if context is None:
-        return ToolResult.failure("ToolContext is required", blocked=True)
     allowed, reason = context.mutation_allowed(f"patch {filepath}")
     if not allowed:
         return ToolResult.failure(reason or "Patch blocked", blocked=True)
@@ -361,7 +368,10 @@ def patch_handler(
 
     new_content = content.replace(old_string, new_string)
     try:
-        result = _commit_text_change(filepath, before, new_content, context, operation="patch")
+        result = _commit_text_change(
+            filepath, before, new_content, context,
+            operation="patch", display_path=shown_path,
+        )
         result["replacements"] = count
         return result
     except Exception as e:

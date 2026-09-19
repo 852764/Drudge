@@ -20,6 +20,27 @@ def is_sensitive_path(path: Path) -> bool:
     return path.name.lower() == "auth.json" and bool({".drudge", ".codex"} & parts)
 
 
+def display_path(path: str | Path) -> Path:
+    """Return an absolute user-facing path without resolving aliases/symlinks."""
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
+def path_identity(path: str | Path) -> str:
+    """Return the canonical identity used for security boundary comparisons."""
+    return os.path.normcase(os.path.realpath(os.fspath(path)))
+
+
+def is_within_path(path: str | Path, root: str | Path) -> bool:
+    """Check containment after resolving aliases without prefix collisions."""
+    candidate = Path(path_identity(path))
+    base = Path(path_identity(root))
+    try:
+        candidate.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
 @dataclass(frozen=True, slots=True)
 class ToolContext:
     workspace: Path
@@ -59,7 +80,7 @@ class ToolContext:
         save_tool_output: Callable[..., dict[str, Any]] | None = None,
         read_tool_output: Callable[..., dict[str, Any]] | None = None,
     ) -> "ToolContext":
-        workspace = Path(security.get("workspace_root") or os.getcwd()).expanduser().resolve()
+        workspace = display_path(security.get("workspace_root") or os.getcwd())
         return cls(
             workspace=workspace,
             enabled_toolsets=frozenset(toolsets),
@@ -90,9 +111,15 @@ class ToolContext:
         if is_sensitive_path(resolved):
             raise PermissionError("Access to credential files is blocked")
         if not self.allow_outside_workspace:
-            if resolved != self.workspace and self.workspace not in resolved.parents:
+            if not is_within_path(resolved, self.workspace):
                 raise PermissionError(f"Path outside workspace is blocked: {resolved}")
         return resolved
+
+    def display_path(self, path: str | Path) -> Path:
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.workspace / candidate
+        return display_path(candidate)
 
     def mutation_allowed(self, action: str) -> tuple[bool, str | None]:
         if self.approval_mode == ApprovalMode.NEVER.value:
