@@ -111,5 +111,6 @@ python scripts/release_check.py
 - [工具状态与大输出分页](docs/TOOL_OUTPUTS.md)
 - [持久化计划与验收记录](docs/PERSISTENT_PLANS.md)
 - [Beta 发布门槛与运维说明](docs/RELEASE.md)
+- [版本变更记录](docs/CHANGELOG.md)
 - [CodeGo 真实试用记录与本轮改进](docs/DOGFOOD_CODEGO.md)
 - [仓库搜索、忽略规则与扫描预算](docs/REPOSITORY_SEARCH.md)
