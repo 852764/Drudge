@@ -9,7 +9,7 @@ from unittest.mock import patch
 import zipfile
 
 from config import tomllib
-from scripts.release_check import check_archive, check_content, forbidden_path, source_hygiene
+from scripts.release_check import check_archive, check_content, failure_excerpt, forbidden_path, source_hygiene
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +73,18 @@ class ReleaseCheckTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         for required in ("'3.10'", "windows-latest", "ubuntu-latest", "macos-latest", "scripts/release_check.py", "contents: read"):
             self.assertIn(required, workflow)
+
+    def test_failure_excerpt_surfaces_cross_platform_test_diagnostics(self):
+        excerpt = failure_excerpt("""test_fixture ... FAIL
+details are here
+Traceback (most recent call last):
+  AssertionError: expected value
+Ran 1 test in 0.01s
+FAILED (failures=1)
+""")
+        self.assertIn("test_fixture ... FAIL", excerpt)
+        self.assertIn("AssertionError", excerpt)
+        self.assertIn("FAILED (failures=1)", excerpt)
 
 
 if __name__ == "__main__":

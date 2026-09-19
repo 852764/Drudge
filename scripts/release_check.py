@@ -101,6 +101,26 @@ def check_archive(path: Path) -> dict:
     return {"file": path.name, "entries": len(names), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
+def failure_excerpt(text: str, *, max_lines: int = 80) -> str:
+    """Keep CI failures actionable without dumping an entire test log."""
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    markers = ("FAIL:", "ERROR:", "Traceback", "FAILED", "AssertionError", "Ran ")
+    selected: list[str] = []
+    for index, line in enumerate(lines):
+        if any(marker in line for marker in markers):
+            selected.extend(lines[max(0, index - 2): min(len(lines), index + 8)])
+    selected.extend(lines[-20:])
+    unique: list[str] = []
+    seen: set[str] = set()
+    for line in selected:
+        if line not in seen:
+            seen.add(line)
+            unique.append(line)
+    return "\n".join(unique[-max_lines:])
+
+
 def main() -> int:
     base = ROOT / "build" / "release-check"
     if not base.resolve().is_relative_to(ROOT) or base.is_symlink():
@@ -122,6 +142,10 @@ def main() -> int:
             completed = subprocess.run(command, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT, timeout=timeout)
         report["steps"].append({"name": name, "exit_code": completed.returncode, "seconds": round(time.monotonic() - started, 3), "log": log.name})
         if completed.returncode:
+            content = log.read_text(encoding="utf-8", errors="replace")
+            excerpt = failure_excerpt(content)
+            report["steps"][-1]["failure_excerpt"] = excerpt
+            print(f"{name} failure excerpt:\n{excerpt}", file=sys.stderr, flush=True)
             raise RuntimeError(f"{name} failed with exit {completed.returncode}; inspect {log}")
         return log.read_text(encoding="utf-8", errors="replace")
 

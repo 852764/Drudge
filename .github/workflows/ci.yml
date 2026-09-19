@@ -30,6 +30,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install runtime and build dependencies
         run: python -m pip install . setuptools wheel
+      - name: Cross-platform regression tests
+        run: python -m unittest discover -s tests -v
       - name: Offline release gate
         run: python scripts/release_check.py
       - name: Upload verification evidence
