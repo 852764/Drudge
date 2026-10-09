@@ -7,7 +7,7 @@ import json
 from typing import Any
 
 
-MESSAGE_FIELDS = ("role", "content", "tool_call_id", "tool_calls", "provider_items")
+MESSAGE_FIELDS = ("role", "content", "tool_call_id", "tool_calls", "provider_items", "provider_state")
 
 
 def message_from_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -15,7 +15,7 @@ def message_from_row(row: dict[str, Any]) -> dict[str, Any]:
     if row.get("tool_call_id"):
         message["tool_call_id"] = row["tool_call_id"]
     metadata = row.get("metadata") or {}
-    for key in ("tool_calls", "provider_items"):
+    for key in ("tool_calls", "provider_items", "provider_state"):
         if metadata.get(key):
             message[key] = metadata[key]
     return message
@@ -29,6 +29,8 @@ def encode_context(messages: list[dict[str, Any]]) -> str:
     for message in messages:
         if not isinstance(message, dict) or message.get("role") not in {"system", "user", "assistant", "tool"}:
             raise ValueError("Invalid context message role")
+        if "provider_state" in message and not isinstance(message["provider_state"], dict):
+            raise ValueError("Context provider_state must be an object")
         for field in ("tool_calls", "provider_items"):
             if field in message and (
                 not isinstance(message[field], list)

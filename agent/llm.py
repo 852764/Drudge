@@ -7,10 +7,11 @@ import inspect
 import json
 import math
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import httpx
 
-from .model_errors import ContextWindowExceeded, context_window_error
+from .model_errors import ContextWindowExceeded, ProviderHTTPError, context_window_error
 
 
 # These are the status codes that commonly represent a transient provider or
@@ -28,7 +29,7 @@ class LLMClient:
         base_url: str,
         api_key: str,
         model: str,
-        temperature: float = 0.7,
+        temperature: float | None = 0.7,
         max_tokens: int = 4096,
         model_aliases: dict[str, str] | None = None,
         api_type: str = "auto",
@@ -39,11 +40,28 @@ class LLMClient:
         reasoning_effort: str | None = None,
         disable_response_storage: bool = False,
         transport: httpx.AsyncBaseTransport | None = None,
+        chat_token_limit: str = "max_tokens",
+        stream_usage: bool = False,
     ):
+        parsed_url = urlsplit(base_url)
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.hostname or parsed_url.username or parsed_url.password or parsed_url.query or parsed_url.fragment:
+            raise ValueError("model.base_url must be an HTTP(S) URL without embedded credentials, query or fragment; use headers/query_params")
         self.base_url = base_url.rstrip("/")
+        for endpoint in ("/chat/completions", "/responses", "/messages"):
+            if self.base_url.endswith(endpoint):
+                self.base_url = self.base_url[:-len(endpoint)]
+                break
         self.api_key = api_key
         self.model = model
         self.temperature = temperature
+        if temperature is not None and (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or not math.isfinite(temperature)):
+            raise ValueError("model.temperature must be a finite number or null")
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1:
+            raise ValueError("model.max_tokens must be a positive integer")
+        if chat_token_limit not in ("max_tokens", "max_completion_tokens"):
+            raise ValueError("model.chat_token_limit must be max_tokens or max_completion_tokens")
+        self.chat_token_limit = chat_token_limit
+        self.stream_usage = stream_usage
         self.max_tokens = max_tokens
         self.model_aliases = model_aliases or {}
         self.api_type = api_type
@@ -88,7 +106,7 @@ class LLMClient:
                 raise
             except RuntimeError as error:
                 last_error = str(error)
-                if self.api_type == "auto" and api_type == "chat" and "HTTP 404" in last_error:
+                if self.api_type == "auto" and api_type == "chat" and isinstance(error, ProviderHTTPError) and error.status_code == 404:
                     continue
                 raise
         raise RuntimeError(last_error or "LLM request failed")
@@ -113,11 +131,8 @@ class LLMClient:
         tool_choice: str | None = None,
     ) -> dict:
         url = f"{self.base_url}/chat/completions"
-        body = {
-            "messages": self._messages_to_chat_input(messages),
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-        }
+        body = {"messages": self._messages_to_chat_input(messages)}
+        self._apply_generation_options(body, "chat")
         if tools:
             body["tools"] = tools
             body["tool_choice"] = tool_choice or "auto"
@@ -125,32 +140,40 @@ class LLMClient:
         last_error = None
         for model in self._candidate_models():
             body["model"] = model
+            body["messages"] = self._chat_input(messages, model)
             for attempt in range(self.max_retries):
                 try:
                     data = await self._post_json(url, body)
-                    return {
+                    result = {
                         "id": data.get("id", ""),
                         "model": data.get("model", model),
                         "choices": data.get("choices", []),
                         "usage": data.get("usage", {}),
                     }
+                    choices = data.get("choices") or []
+                    reasoning = (choices[0].get("message") or {}).get("reasoning_content") if choices else None
+                    if isinstance(reasoning, str):
+                        result["provider_state"] = self._chat_state(model, reasoning)
+                    return result
                 except httpx.HTTPStatusError as error:
                     overflow = context_window_error(error.response)
                     if overflow:
                         raise overflow from error
-                    last_error = self._format_http_error(error, model, endpoint="chat/completions")
+                    last_error = ProviderHTTPError(self._format_http_error(error, model, endpoint="chat/completions"), status_code=error.response.status_code)
                     if self._should_retry_status(error.response.status_code, attempt):
                         await asyncio.sleep(self._retry_delay(error.response, attempt))
                         continue
                     if error.response.status_code == 404:
                         break
-                    break
-                except (httpx.TimeoutException, httpx.ConnectError) as error:
-                    last_error = self._exception_text(error)
+                    raise last_error from error
+                except httpx.TransportError as error:
+                    last_error = self._redact_error(self._exception_text(error))
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(min(2 ** attempt, MAX_RETRY_DELAY_SECONDS))
                         continue
-                    break
+                    raise RuntimeError(f"LLM transport failed: {last_error}") from error
+        if isinstance(last_error, ProviderHTTPError):
+            raise last_error
         raise RuntimeError(f"LLM request failed after {self.max_retries} attempts: {last_error}")
 
     async def _responses(
@@ -160,11 +183,8 @@ class LLMClient:
         tool_choice: str | None = None,
     ) -> dict:
         url = f"{self.base_url}/responses"
-        body = {
-            "input": self._messages_to_responses_input(messages),
-            "temperature": self.temperature,
-            "max_output_tokens": self.max_tokens,
-        }
+        body = {"input": self._messages_to_responses_input(messages)}
+        self._apply_generation_options(body, "responses")
         self._apply_responses_options(body)
         if tools:
             body["tools"] = self._tools_to_responses_tools(tools)
@@ -181,19 +201,21 @@ class LLMClient:
                     overflow = context_window_error(error.response)
                     if overflow:
                         raise overflow from error
-                    last_error = self._format_http_error(error, model, endpoint="responses")
+                    last_error = ProviderHTTPError(self._format_http_error(error, model, endpoint="responses"), status_code=error.response.status_code)
                     if self._should_retry_status(error.response.status_code, attempt):
                         await asyncio.sleep(self._retry_delay(error.response, attempt))
                         continue
                     if error.response.status_code == 404:
                         break
-                    break
-                except (httpx.TimeoutException, httpx.ConnectError) as error:
-                    last_error = self._exception_text(error)
+                    raise last_error from error
+                except httpx.TransportError as error:
+                    last_error = self._redact_error(self._exception_text(error))
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(min(2 ** attempt, MAX_RETRY_DELAY_SECONDS))
                         continue
-                    break
+                    raise RuntimeError(f"Responses transport failed: {last_error}") from error
+        if isinstance(last_error, ProviderHTTPError):
+            raise last_error
         raise RuntimeError(f"Responses request failed after {self.max_retries} attempts: {last_error}")
 
     async def _chat_completions_stream(
@@ -207,10 +229,11 @@ class LLMClient:
         url = f"{self.base_url}/chat/completions"
         body: dict[str, Any] = {
             "messages": self._messages_to_chat_input(messages),
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
             "stream": True,
         }
+        self._apply_generation_options(body, "chat")
+        if self.stream_usage:
+            body["stream_options"] = {"include_usage": True}
         if tools:
             body["tools"] = tools
             body["tool_choice"] = tool_choice or "auto"
@@ -218,8 +241,10 @@ class LLMClient:
         last_error = None
         for model in self._candidate_models():
             body["model"] = model
+            body["messages"] = self._chat_input(messages, model)
             for attempt in range(self.max_retries):
                 text_parts: list[str] = []
+                reasoning_parts: list[str] = []
                 tool_parts: dict[int, dict[str, Any]] = {}
                 usage: dict[str, Any] = {}
                 finish_reason = "stop"
@@ -252,6 +277,8 @@ class LLMClient:
                                     saw_terminal = True
                                     break
                                 event = json.loads(raw)
+                                if event.get("error"):
+                                    raise RuntimeError("Chat stream error: " + self._redact_error(str(event["error"]))[:500])
                                 response_id = str(event.get("id") or response_id)
                                 response_model = str(event.get("model") or response_model)
                                 if isinstance(event.get("usage"), dict):
@@ -264,6 +291,8 @@ class LLMClient:
                                     finish_reason = str(choice["finish_reason"])
                                     saw_terminal = True
                                 delta = choice.get("delta") or {}
+                                if isinstance(delta.get("reasoning_content"), str):
+                                    reasoning_parts.append(delta["reasoning_content"])
                                 content = delta.get("content")
                                 if isinstance(content, str) and content:
                                     text_parts.append(content)
@@ -282,7 +311,7 @@ class LLMClient:
                                     current["function"]["arguments"] += str(function.get("arguments") or "")
                     if not saw_terminal:
                         raise RuntimeError("Chat stream ended without a terminal event")
-                    return {
+                    result = {
                         "id": response_id,
                         "model": response_model,
                         "choices": [{
@@ -295,27 +324,36 @@ class LLMClient:
                         }],
                         "usage": usage,
                     }
+                    if reasoning_parts:
+                        result["provider_state"] = self._chat_state(model, "".join(reasoning_parts))
+                    return result
                 except json.JSONDecodeError as error:
                     raise RuntimeError(f"Invalid SSE payload from chat/completions: {error}") from error
                 except httpx.HTTPStatusError as error:
                     overflow = context_window_error(error.response)
-                    if overflow and not (text_parts or tool_parts):
+                    if overflow and not (text_parts or tool_parts or reasoning_parts):
                         raise overflow from error
-                    last_error = self._format_http_error(error, model, endpoint="chat/completions")
+                    last_error = ProviderHTTPError(self._format_http_error(error, model, endpoint="chat/completions"), status_code=error.response.status_code)
+                    if text_parts or tool_parts or reasoning_parts:
+                        raise RuntimeError("Chat stream interrupted after partial output") from error
                     if self._should_retry_status(error.response.status_code, attempt):
                         await asyncio.sleep(self._retry_delay(error.response, attempt))
                         continue
-                    break
-                except (httpx.TimeoutException, httpx.ConnectError) as error:
-                    last_error = self._exception_text(error)
-                    if text_parts or tool_parts:
+                    if error.response.status_code == 404:
+                        break
+                    raise last_error from error
+                except httpx.TransportError as error:
+                    last_error = self._redact_error(self._exception_text(error))
+                    if text_parts or tool_parts or reasoning_parts:
                         raise RuntimeError(
-                            f"Chat stream interrupted after partial output: {self._exception_text(error)}"
+                            f"Chat stream interrupted after partial output: {last_error}"
                         ) from error
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(min(2 ** attempt, 10))
                         continue
-                    break
+                    raise RuntimeError(f"Chat streaming transport failed: {last_error}") from error
+        if isinstance(last_error, ProviderHTTPError):
+            raise last_error
         raise RuntimeError(f"Streaming LLM request failed: {last_error}")
 
     async def _responses_stream(
@@ -329,10 +367,9 @@ class LLMClient:
         url = f"{self.base_url}/responses"
         body: dict[str, Any] = {
             "input": self._messages_to_responses_input(messages),
-            "temperature": self.temperature,
-            "max_output_tokens": self.max_tokens,
             "stream": True,
         }
+        self._apply_generation_options(body, "responses")
         self._apply_responses_options(body)
         if tools:
             body["tools"] = self._tools_to_responses_tools(tools)
@@ -344,6 +381,7 @@ class LLMClient:
             for attempt in range(self.max_retries):
                 output_items: list[dict] = []
                 text_parts: list[str] = []
+                saw_output_progress = False
                 terminal: dict[str, Any] = {}
                 saw_terminal = False
                 try:
@@ -370,6 +408,8 @@ class LLMClient:
                                     continue
                                 event = json.loads(raw)
                                 event_type = str(event.get("type") or "")
+                                if event_type.startswith(("response.output_", "response.function_call_", "response.reasoning_")):
+                                    saw_output_progress = True
                                 if event_type == "response.output_text.delta":
                                     delta = str(event.get("delta") or "")
                                     if delta:
@@ -380,7 +420,7 @@ class LLMClient:
                                     if isinstance(item, dict):
                                         output_items.append(item)
                                 elif event_type == "error":
-                                    raise RuntimeError(str(event.get("message") or "Responses stream error"))
+                                    raise RuntimeError(self._redact_error(str(event.get("message") or "Responses stream error"))[:500])
                                 elif event_type in (
                                     "response.completed",
                                     "response.incomplete",
@@ -391,7 +431,7 @@ class LLMClient:
                                     if event_type == "response.incomplete":
                                         terminal["status"] = "incomplete"
                                     if event_type == "response.failed":
-                                        raise RuntimeError(f"Responses stream failed: {terminal.get('error') or event}")
+                                        raise RuntimeError("Responses stream failed: " + self._redact_error(str(terminal.get('error') or event))[:500])
                                     break
                     if not saw_terminal:
                         raise RuntimeError("Responses stream ended without a terminal event")
@@ -405,23 +445,29 @@ class LLMClient:
                     raise RuntimeError(f"Invalid SSE payload from responses: {error}") from error
                 except httpx.HTTPStatusError as error:
                     overflow = context_window_error(error.response)
-                    if overflow and not (text_parts or output_items):
+                    if overflow and not saw_output_progress:
                         raise overflow from error
-                    last_error = self._format_http_error(error, model, endpoint="responses")
+                    last_error = ProviderHTTPError(self._format_http_error(error, model, endpoint="responses"), status_code=error.response.status_code)
+                    if saw_output_progress:
+                        raise RuntimeError("Responses stream interrupted after partial output") from error
                     if self._should_retry_status(error.response.status_code, attempt):
                         await asyncio.sleep(self._retry_delay(error.response, attempt))
                         continue
-                    break
-                except (httpx.TimeoutException, httpx.ConnectError) as error:
-                    last_error = self._exception_text(error)
-                    if text_parts or output_items:
+                    if error.response.status_code == 404:
+                        break
+                    raise last_error from error
+                except httpx.TransportError as error:
+                    last_error = self._redact_error(self._exception_text(error))
+                    if saw_output_progress:
                         raise RuntimeError(
-                            f"Responses stream interrupted after partial output: {self._exception_text(error)}"
+                            f"Responses stream interrupted after partial output: {last_error}"
                         ) from error
                     if attempt < self.max_retries - 1:
                         await asyncio.sleep(min(2 ** attempt, 10))
                         continue
-                    break
+                    raise RuntimeError(f"Responses streaming transport failed: {last_error}") from error
+        if isinstance(last_error, ProviderHTTPError):
+            raise last_error
         raise RuntimeError(f"Streaming Responses request failed: {last_error}")
 
     async def _post_json(self, url: str, body: dict) -> dict:
@@ -477,7 +523,7 @@ class LLMClient:
 
     def _request_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
-        if self.api_key:
+        if self.api_key and not any(str(key).lower() == "authorization" for key in self.default_headers):
             headers["Authorization"] = f"Bearer {self.api_key}"
         headers.update({str(key): str(value) for key, value in self.default_headers.items()})
         return headers
@@ -494,6 +540,29 @@ class LLMClient:
             body["reasoning"] = {"effort": self.reasoning_effort}
         if self.disable_response_storage:
             body["store"] = False
+
+    def _apply_generation_options(self, body: dict, api: str) -> None:
+        if self.temperature is not None:
+            body["temperature"] = self.temperature
+        body[self.chat_token_limit if api == "chat" else "max_output_tokens"] = self.max_tokens
+        if api == "chat" and self.reasoning_effort:
+            body["reasoning_effort"] = self.reasoning_effort
+
+    def _state_matches(self, state: Any, api: str, model: str) -> bool:
+        return (isinstance(state, dict) and state.get("api") == api
+                and state.get("base_url") == self.base_url and state.get("model") == model)
+
+    def _chat_state(self, model: str, reasoning: str) -> dict:
+        return {"api": "chat", "base_url": self.base_url, "model": model, "reasoning_content": reasoning}
+
+    def _chat_input(self, messages: list[dict], model: str) -> list[dict]:
+        converted = self._messages_to_chat_input(messages)
+        for original, item in zip(messages, converted):
+            state = original.get("provider_state")
+            if (original.get("role") == "assistant" and self._state_matches(state, "chat", model)
+                    and isinstance(state.get("reasoning_content"), str)):
+                item["reasoning_content"] = state["reasoning_content"]
+        return converted
 
     @staticmethod
     def _messages_to_chat_input(messages: list[dict]) -> list[dict]:
@@ -602,7 +671,7 @@ class LLMClient:
         endpoint: str = "chat/completions",
     ) -> str:
         status_code = error.response.status_code
-        response_text = error.response.text[:500]
+        response_text = self._redact_error(error.response.text)[:500]
         active_model = model or self.model
         message = f"HTTP {status_code} on /{endpoint}: {response_text}"
         if status_code == 404 and active_model:
@@ -614,6 +683,17 @@ class LLMClient:
             if alias:
                 message += f" Configured alias fallback: '{alias}'."
         return message
+
+    def _redact_error(self, text: str) -> str:
+        secrets = [self.api_key]
+        secrets.extend(str(value) for key, value in self.default_headers.items()
+                       if any(marker in str(key).lower() for marker in ("auth", "key", "token", "secret")))
+        secrets.extend(str(value) for key, value in self.query_params.items()
+                       if any(marker in str(key).lower() for marker in ("auth", "key", "token", "secret")))
+        for secret in sorted(set(secrets), key=len, reverse=True):
+            if secret:
+                text = text.replace(secret, "[REDACTED]")
+        return text
 
     @staticmethod
     def extract_text(response: dict) -> str | None:
@@ -656,7 +736,7 @@ class LLMClient:
                 continue
             wire = {
                 key: message[key]
-                for key in ("role", "content", "name", "tool_call_id", "tool_calls", "provider_items")
+                for key in ("role", "content", "name", "tool_call_id", "tool_calls", "provider_items", "provider_state")
                 if key in message and message[key] not in (None, "", [], {})
             }
             try:
@@ -675,6 +755,9 @@ class LLMClient:
 
 
 def create_client(config: dict) -> LLMClient:
+    from model_config import resolve_model_config
+
+    config = resolve_model_config(config)
     if (
         config.get("provider") == "openai-codex"
         or config.get("api") == "codex_responses"
@@ -686,7 +769,12 @@ def create_client(config: dict) -> LLMClient:
             timeout=config.get("timeout", 300),
             max_retries=config.get("max_retries", 3),
         )
-    return LLMClient(
+    client_type = LLMClient
+    if config.get("api") == "anthropic":
+        from .anthropic_client import AnthropicClient
+
+        client_type = AnthropicClient
+    return client_type(
         base_url=config["base_url"],
         api_key=config.get("api_key", ""),
         model=config["name"],
@@ -700,4 +788,6 @@ def create_client(config: dict) -> LLMClient:
         max_retries=config.get("max_retries", 3),
         reasoning_effort=config.get("reasoning_effort"),
         disable_response_storage=bool(config.get("disable_response_storage", False)),
+        chat_token_limit=config.get("chat_token_limit", "max_tokens"),
+        stream_usage=bool(config.get("stream_usage", False)),
     )

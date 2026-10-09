@@ -1727,6 +1727,9 @@ class Agent:
                 metadata = {"tool_calls": tool_calls}
                 if response.get("provider_items"):
                     metadata["provider_items"] = response["provider_items"]
+                if isinstance(response.get("provider_state"), dict):
+                    assistant_msg["provider_state"] = response["provider_state"]
+                    metadata["provider_state"] = response["provider_state"]
                 self._persist_message("assistant", text, metadata=metadata)
 
                 for tc in tool_calls:

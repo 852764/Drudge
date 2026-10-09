@@ -66,14 +66,17 @@ def _own_job() -> int:
 
 
 def main() -> int:
-    if os.name != "nt" or len(sys.argv) != 2:
-        print("Windows command owner requires exactly one command", file=sys.stderr, flush=True)
+    direct = len(sys.argv) >= 3 and sys.argv[1] == "--exec"
+    if os.name != "nt" or (len(sys.argv) != 2 and not direct):
+        print("Windows command owner requires a shell command or --exec argv", file=sys.stderr, flush=True)
         return 125
     try:
         _own_job()
     except OSError as exc:
         print(f"Command not started: Windows Job Object setup failed: {exc}", file=sys.stderr, flush=True)
         return 125
+    if direct:
+        return subprocess.call(sys.argv[2:], shell=False)
     return subprocess.call(sys.argv[1], shell=True, executable=os.environ.get("COMSPEC", "cmd.exe"))
 
 

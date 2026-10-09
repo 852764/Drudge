@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from model_config import merge_model_config, resolve_model_config
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10
@@ -95,6 +97,16 @@ class ConfigManager:
         codex_config_path: str | None = None,
     ):
         self._config = deepcopy(DEFAULT_CONFIG)
+        environment = {
+            key: os.environ[env] for key, env in (
+                ("provider", "DRUDGE_MODEL_PROVIDER"), ("name", "DRUDGE_MODEL"),
+                ("base_url", "DRUDGE_BASE_URL"), ("api_key", "DRUDGE_API_KEY"),
+                ("api", "DRUDGE_MODEL_API"), ("reasoning_effort", "DRUDGE_MODEL_REASONING_EFFORT"),
+            ) if env in os.environ
+        }
+        # Provider environment overrides get the same defaults as YAML selection.
+        baseline = dict(self._config["model"], provider="custom")
+        self._config["model"] = merge_model_config(baseline, environment)
         self.codex_config_path: Path | None = None
         if codex_config_path:
             self.load_codex(codex_config_path)
@@ -110,6 +122,11 @@ class ConfigManager:
             loaded = yaml.safe_load(file) or {}
         if not isinstance(loaded, dict):
             raise ValueError("Config file must contain a YAML mapping")
+        if "model" in loaded:
+            if not isinstance(loaded["model"], dict):
+                raise ValueError("model must be a mapping")
+            self._config["model"] = merge_model_config(self._config["model"], loaded["model"])
+            loaded = {key: value for key, value in loaded.items() if key != "model"}
         self._deep_update(self._config, loaded)
 
     @staticmethod
@@ -142,6 +159,14 @@ class ConfigManager:
         model_update: dict[str, Any] = {
             "api": "responses",
             "provider": provider_id,
+            # Each imported provider describes its own authentication, even if
+            # its ID is reused with another endpoint in a later import.
+            "api_key": "",
+            "api_key_env": "",
+            "headers": {},
+            "env_headers": {},
+            "query_params": {},
+            "auth_mode": "api_key",
         }
         if effective.get("model"):
             model_update["name"] = effective["model"]
@@ -217,11 +242,14 @@ class ConfigManager:
                     raise ValueError("Codex request_max_retries must be between 1 and 100")
                 model_update["max_retries"] = max_retries
 
-        self._deep_update(self._config["model"], model_update)
+        self._config["model"] = merge_model_config(self._config["model"], model_update)
         self.codex_config_path = path.resolve()
 
     def get(self, *keys: str, default: Any = None) -> Any:
         current: Any = self._config
+        if keys and keys[0] == "model":
+            current = resolve_model_config(self._config["model"])
+            keys = keys[1:]
         for key in keys:
             if not isinstance(current, dict) or key not in current:
                 return default
@@ -238,14 +266,11 @@ class ConfigManager:
 
     def get_utility_model_config(self) -> dict[str, Any]:
         """Return utility model settings overlaid on the primary model settings."""
-        merged = deepcopy(self.get_model_config())
+        merged = deepcopy(self._config["model"])
         override = self.get("utility_model", default=None)
         if isinstance(override, dict):
-            self._deep_update(merged, override)
-        api_key_env = merged.get("api_key_env")
-        if api_key_env:
-            merged["api_key"] = os.getenv(str(api_key_env), merged.get("api_key", ""))
-        return merged
+            merged = merge_model_config(merged, override, isolate_endpoint=True)
+        return resolve_model_config(merged)
 
     def get_agent_config(self) -> dict[str, Any]:
         return self.get("agent", default={})
@@ -299,6 +324,14 @@ class ConfigManager:
     def override(self, *keys: str, value: Any) -> None:
         if not keys:
             raise ValueError("override requires at least one key")
+        if keys == ("model",):
+            if not isinstance(value, dict):
+                raise ValueError("model must be a mapping")
+            self._config["model"] = merge_model_config(self._config["model"], value)
+            return
+        if len(keys) == 2 and keys[0] == "model":
+            self._config["model"] = merge_model_config(self._config["model"], {keys[1]: value})
+            return
         current = self._config
         for key in keys[:-1]:
             current = current.setdefault(key, {})

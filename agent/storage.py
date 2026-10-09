@@ -381,7 +381,7 @@ class ConversationStore:
         conn: sqlite3.Connection, session_id: str, message: dict[str, Any],
         *, repaired: bool = False,
     ) -> int:
-        metadata = {key: message[key] for key in ("tool_calls", "provider_items") if key in message}
+        metadata = {key: message[key] for key in ("tool_calls", "provider_items", "provider_state") if key in message}
         if repaired:
             metadata["repaired"] = True
         cursor = conn.execute(

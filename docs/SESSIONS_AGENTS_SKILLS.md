@@ -92,6 +92,8 @@ agent:
 
 全局 Skill 目录是 `$DRUDGE_HOME/skills`，项目 Skill 会覆盖同名全局 Skill。
 
+也支持复制或安装 Codex 格式的技能完整目录。官方技能的推荐列表、固定版本安装命令及 Drudge 执行差异见[Codex skills 接入说明](CODEX_SKILLS.md)。
+
 `SKILL.md` 示例：
 
 ```markdown

@@ -7,10 +7,12 @@ import json
 import os
 import sqlite3
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 
 from agent import Agent, AgentRuntime, RunStatus
 from agent.cli_renderer import CliRenderer
+from agent.approval_menu import ApprovalCancelled, prompt_approval
 from agent.llm import create_client
 from config import ConfigManager, get_config
 from tools import ApprovalDecision, ApprovalRequest
@@ -22,25 +24,24 @@ VERSION = "0.2.0b3"
 class ConsoleApproval:
     """Interactive approval callback for approval_mode=on_request."""
 
+    def __init__(self, renderer: CliRenderer | None = None):
+        self.renderer = renderer
+
     async def __call__(self, request: ApprovalRequest) -> ApprovalDecision:
-        if not sys.stdin.isatty():
+        if (not sys.stdin.isatty() or not sys.stdout.isatty()
+                or (sys.platform != "win32" and os.getenv("TERM") == "dumb")):
             print(
-                f"\n[approval denied] {request.tool_name}: no interactive terminal",
+                "\n[approval denied] no interactive terminal for the approval menu",
                 file=sys.stderr,
             )
             return ApprovalDecision.DENY
-        print(f"\n[approval] risk={request.risk.level.value} tool={request.tool_name}")
-        print(f"Action: {request.risk.action}")
-        answer = await asyncio.to_thread(
-            input,
-            "Allow? [y] once / [a] this tool+risk for session / [N] deny: ",
-        )
-        normalized = answer.strip().lower()
-        if normalized in ("y", "yes"):
-            return ApprovalDecision.ALLOW_ONCE
-        if normalized in ("a", "always"):
-            return ApprovalDecision.ALLOW_SESSION
-        return ApprovalDecision.DENY
+        try:
+            with self.renderer.suspend_status() if self.renderer else nullcontext():
+                return await prompt_approval(request, color=bool(self.renderer and self.renderer.color))
+        except Exception as exc:
+            # Fail closed if the terminal/UI is unavailable; never start an input worker.
+            print(f"\n[approval denied] approval menu error: {type(exc).__name__}", file=sys.stderr)
+            return ApprovalDecision.DENY
 
 
 def _make_renderer(config) -> CliRenderer:
@@ -293,7 +294,7 @@ async def run_query(
         config.override("security", "approval_mode", value=approval_mode)
 
     _validate_runtime_config(config)
-    agent = Agent(config, approval_callback=ConsoleApproval())
+    agent = Agent(config, approval_callback=ConsoleApproval(renderer))
     _attach_renderer(agent, renderer)
 
     renderer.print_banner(
@@ -392,7 +393,7 @@ async def run_status(
         config.override("security", "approval_mode", value=approval_mode)
     if config.get("model", "auth_mode") == "codex_oauth":
         _validate_runtime_config(config)
-    agent = Agent(config, approval_callback=ConsoleApproval())
+    agent = Agent(config, approval_callback=ConsoleApproval(renderer))
     _attach_renderer(agent, renderer)
     if resume_id:
         agent.resume_session(resume_id)
@@ -413,8 +414,7 @@ def run_interactive(
 ) -> None:
     """交互式对话模式"""
     try:
-        from prompt_toolkit import PromptSession
-        from prompt_toolkit.styles import Style
+        from agent.cli_input import create_prompt_session
     except ImportError:
         print("prompt_toolkit not installed. Install with: pip install prompt-toolkit")
         _run_simple_interactive(
@@ -426,6 +426,14 @@ def run_interactive(
             approval_mode,
             resume_id,
             skill_names,
+        )
+        return
+
+    if (not sys.stdin.isatty() or not sys.stdout.isatty()
+            or (sys.platform != "win32" and os.getenv("TERM") == "dumb")):
+        _run_simple_interactive(
+            config_path, model, no_tools, codex_config_path, codex_oauth,
+            approval_mode, resume_id, skill_names,
         )
         return
 
@@ -441,7 +449,7 @@ def run_interactive(
     if approval_mode:
         config.override("security", "approval_mode", value=approval_mode)
     _validate_runtime_config(config)
-    agent = Agent(config, approval_callback=ConsoleApproval())
+    agent = Agent(config, approval_callback=ConsoleApproval(renderer))
     _attach_renderer(agent, renderer)
     try:
         _configure_agent_extensions(agent, resume_id, skill_names, renderer)
@@ -449,19 +457,15 @@ def run_interactive(
         print(str(exc), file=sys.stderr)
         return
 
-    style = Style.from_dict({
-        "prompt": "ansicyan bold",
-    })
-
     renderer.print_banner(
         version=VERSION,
         model=config.get("model", "name"),
         toolsets=config.get_toolsets(),
         codex_config_path=config.codex_config_path,
-        subtitle="Type /quit to exit, /help for commands, /tools to list tools",
+        subtitle="Type / for the command menu; Up/Down select, Tab fills; /quit exits",
     )
 
-    session = PromptSession(style=style)
+    session = create_prompt_session(color=renderer.color)
 
     asyncio.run(_interactive_loop(config, agent, renderer=renderer, session=session))
 
@@ -489,7 +493,7 @@ def _run_simple_interactive(
     if approval_mode:
         config.override("security", "approval_mode", value=approval_mode)
     _validate_runtime_config(config)
-    agent = Agent(config, approval_callback=ConsoleApproval())
+    agent = Agent(config, approval_callback=ConsoleApproval(renderer))
     _attach_renderer(agent, renderer)
     try:
         _configure_agent_extensions(agent, resume_id, skill_names, renderer)
@@ -530,7 +534,7 @@ async def _interactive_loop(config, agent: Agent, *, renderer: CliRenderer, sess
 
             try:
                 await _run_runtime_and_print(runtime, user_input, renderer)
-            except KeyboardInterrupt:
+            except (KeyboardInterrupt, ApprovalCancelled):
                 runtime.cancel()
                 renderer.print_note("Cancelled. Ready for the next prompt.", level="warning")
                 continue
@@ -549,7 +553,7 @@ async def _handle_command(cmd: str, config, agent: Agent | None = None, *, rende
     if command in ("/quit", "/exit", "/q"):
         renderer.print_note("Goodbye!", level="info")
         return True
-    elif command == "/help":
+    elif command in ("/help", "/"):
         renderer.print_help()
     elif command == "/tools":
         names = await agent.list_available_tools() if agent else []
@@ -564,6 +568,13 @@ async def _handle_command(cmd: str, config, agent: Agent | None = None, *, rende
         print(yaml.dump(config.as_safe_dict(), default_flow_style=False, allow_unicode=True))
     elif command == "/models":
         await show_models_from_config(config)
+    elif command == "/providers":
+        from model_config import PROVIDER_PRESETS
+
+        renderer.print_list("Model Providers", [
+            f"{name}: api={preset['api']} | env={preset['api_key_env'] or '(local / no key)'} | {preset['base_url']}"
+            for name, preset in PROVIDER_PRESETS.items()
+        ] + ["custom: explicitly configure base_url, api and api_key_env; existing CodeGo configuration is unchanged."])
     elif command == "/sessions":
         _show_sessions(config)
     elif command == "/history":

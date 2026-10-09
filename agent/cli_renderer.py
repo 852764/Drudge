@@ -7,9 +7,12 @@ import re
 import shutil
 import sys
 import textwrap
+from contextlib import contextmanager
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any, Callable, TextIO
+
+from agent.slash_commands import command_help_lines
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -54,6 +57,7 @@ class CliRenderer:
         self.width = max(60, min(terminal_width, 120))
         self.theme = _Theme()
         self._status_width = 0
+        self._status_suspensions = 0
 
     def _enable_color_support(self) -> bool:
         if not self.pretty or os.getenv("NO_COLOR"):
@@ -235,42 +239,7 @@ class CliRenderer:
             )
 
     def print_help(self) -> None:
-        self.print_panel(
-            "Commands",
-            [
-                "/quit, /exit, /q    Exit Drudge",
-                "/help               Show this help",
-                "/tools              List available tools",
-                "/mcp                Inspect configured MCP stdio servers",
-                "/config             Show current config",
-                "/models             List provider models",
-                "/sessions           List saved sessions",
-                "/history [id]       Show saved messages",
-                "/runs               List recent runs",
-                "/trace [run_id]     Show a persisted run trace",
-                "/tasks [all]        List persistent session tasks",
-                "/plan               Show session plan, acceptance criteria and evidence",
-                "/task add <title>   Create a persistent task",
-                "/task start|done|cancel|reopen <id>",
-                "/memory [...]       Manage durable project/user memories",
-                "/changes            List reversible file changes",
-                "/undo [--dry-run]   Revert or preview the latest file change (conflict-checked)",
-                "/outputs            List captured tool outputs in this session",
-                "/output <id> [offset] [limit]  Read an output page (up to 1000 characters)",
-                "/status             Show session, context, and account limits",
-                "/compact            Compact older conversation context",
-                "/resume <id>        Resume a saved session",
-                "/fork [title]       Branch current conversation (workspace files stay shared)",
-                "/new                Start a new session",
-                "/skills             List discovered skills",
-                "/skill <name>       Activate a skill",
-                "/skill off <name>   Deactivate a skill",
-                "/skill show <name>  Show skill metadata",
-                "/skill run <name>   Execute a skill workflow phase",
-                "/skill clear        Deactivate all skills",
-                "/clear              Clear screen",
-            ],
-        )
+        self.print_panel("Commands", command_help_lines())
 
     def _render_panel(
         self,
@@ -390,8 +359,18 @@ class CliRenderer:
         padding = max(0, width - self._visible_len(text))
         return text + (" " * padding)
 
+    @contextmanager
+    def suspend_status(self):
+        """Give a keyboard menu sole ownership of the status-line area."""
+        self.clear_status_line()
+        self._status_suspensions += 1
+        try:
+            yield
+        finally:
+            self._status_suspensions -= 1
+
     def show_status_line(self, text: str) -> None:
-        if not self.pretty:
+        if not self.pretty or self._status_suspensions:
             return
         visible = self._visible_len(text)
         padding = max(0, self._status_width - visible)

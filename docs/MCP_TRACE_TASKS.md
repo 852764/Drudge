@@ -29,7 +29,7 @@ mcp_servers:
 mcp__local-helper__tool-name
 ```
 
-当前支持 stdio transport。一个 run 内的工具调用仍按顺序执行，不支持 MCP sampling、resources 和 prompts。
+当前支持 stdio transport、tools、resources 和 prompts（不支持 MCP sampling）。一个 run 内的工具调用仍按顺序执行。浏览器预设与一键配置见 [JSReverser-MCP 接入说明](BROWSER_MCP.md)。
 
 安全规则：
 
@@ -39,6 +39,10 @@ mcp__local-helper__tool-name
 - approval_mode=on_request 时必须由用户批准；
 - approval_mode=never 会阻止 medium 及以上 MCP 工具；
 - MCP stderr 只保留最近少量内容用于诊断。
+
+可选宿主配置：`allowed_tools` 按上游原始名称过滤工具（空列表禁用全部实际工具）；`include_resources` / `include_prompts` 控制虚拟工具；`inherit_env: false` 与 `env_passthrough` 限定继承的环境变量；`requires_network: true` 让 MCP 调用遵循 `ToolContext.allow_network`。普通 MCP 保持原有环境继承默认值，浏览器预设显式启用隔离。
+
+stdio 消息大小默认 8 MiB，可用 `max_message_bytes` 设置上限。请求使用总超时而非逐行重置超时；超时后远端动作可能继续运行，调用方应检查状态再决定是否重试。退出时回收 MCP 所属进程树，不按进程名终止其他浏览器。
 
 交互命令：
 

@@ -5,14 +5,19 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
+import signal
 import sqlite3
+import subprocess
+import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable
 
-from .context import ToolContext
+from .context import ToolContext, is_within_path
+from .mcp_presets import expand_mcp_preset
 from .registry import ToolRegistry
 from .result import ToolResult, normalize_tool_result
 from .risk import RiskLevel, ToolRisk, coerce_risk_level
@@ -549,11 +554,30 @@ class MCPServerProvider(ToolProvider):
 
     def __init__(self, name: str, config: dict[str, Any], workspace: str | Path) -> None:
         self.name = name
-        self.config = dict(config)
+        self.config = expand_mcp_preset(config, workspace)
         self.workspace = Path(workspace).expanduser().resolve()
         self.namespace = _safe_name(name)
         self.timeout = float(self.config.get("timeout", 30))
+        if not math.isfinite(self.timeout) or self.timeout <= 0:
+            raise ValueError("MCP timeout must be a positive finite number")
+        self.max_message_bytes = self.config.get("max_message_bytes", 8 * 1024 * 1024)
+        if (isinstance(self.max_message_bytes, bool) or not isinstance(self.max_message_bytes, int)
+                or not 4096 <= self.max_message_bytes <= 32 * 1024 * 1024):
+            raise ValueError("MCP max_message_bytes must be between 4096 and 33554432")
+        self.allowed_tools = self.config.get("allowed_tools")
+        if self.allowed_tools is not None and (
+            not isinstance(self.allowed_tools, list)
+            or any(not isinstance(name, str) or not name for name in self.allowed_tools)
+        ):
+            raise ValueError("MCP allowed_tools must be a list of original tool names")
+        for key in ("inherit_env", "requires_network", "create_cwd", "include_resources", "include_prompts"):
+            if key in self.config and not isinstance(self.config[key], bool):
+                raise ValueError(f"MCP {key} must be a boolean")
+        passthrough = self.config.get("env_passthrough", [])
+        if not isinstance(passthrough, list) or any(not isinstance(key, str) for key in passthrough):
+            raise ValueError("MCP env_passthrough must be a list of environment variable names")
         self.risk = coerce_risk_level(self.config.get("risk", "medium"))
+        self._request_lock = asyncio.Lock()
         self.process: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task | None = None
         self._stderr_lines: list[str] = []
@@ -568,6 +592,8 @@ class MCPServerProvider(ToolProvider):
     async def start(self) -> None:
         if self.process and self.process.returncode is None:
             return
+        if self.process is not None:
+            await self.close()
         command = str(self.config.get("command") or "").strip()
         if not command:
             raise ValueError(f"MCP server '{self.name}' has no command")
@@ -576,16 +602,27 @@ class MCPServerProvider(ToolProvider):
         cwd = Path(cwd_value).expanduser() if cwd_value else self.workspace
         if not cwd.is_absolute():
             cwd = self.workspace / cwd
-        env = os.environ.copy()
-        env.update({str(key): str(value) for key, value in (self.config.get("env") or {}).items()})
+        if self.config.get("create_cwd", False):
+            if not is_within_path(cwd, self.workspace):
+                raise ValueError("MCP create_cwd must stay within the workspace")
+            cwd.mkdir(parents=True, exist_ok=True)
+        env = self._environment()
+        spawn_args = [command, *args]
+        platform_options: dict[str, Any] = {"start_new_session": True}
+        if os.name == "nt":
+            # The owner joins a kill-on-close Job before Node can spawn Chrome.
+            owner = str(Path(__file__).with_name("_windows_job.py"))
+            spawn_args = [sys.executable, "-I", owner, "--exec", *spawn_args]
+            platform_options = {"creationflags": subprocess.CREATE_NO_WINDOW}
         self.process = await asyncio.create_subprocess_exec(
-            command,
-            *args,
+            *spawn_args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd.resolve()),
             env=env,
+            limit=self.max_message_bytes,
+            **platform_options,
         )
         self._stderr_task = asyncio.create_task(self._drain_stderr())
         try:
@@ -602,9 +639,18 @@ class MCPServerProvider(ToolProvider):
             await self._load_tools()
             await self._load_optional_capabilities()
             self._error = None
-        except Exception:
+        except BaseException:
             await self.close()
             raise
+
+    def _environment(self) -> dict[str, str]:
+        if self.config.get("inherit_env", True):
+            env = os.environ.copy()
+        else:
+            names = {name.upper() for name in self.config.get("env_passthrough", [])}
+            env = {key: value for key, value in os.environ.items() if key.upper() in names}
+        env.update({str(key): str(value) for key, value in (self.config.get("env") or {}).items()})
+        return env
 
     async def close(self) -> None:
         process = self.process
@@ -616,13 +662,39 @@ class MCPServerProvider(ToolProvider):
         if process:
             if process.stdin:
                 process.stdin.close()
-            if process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=2)
-                except asyncio.TimeoutError:
+            async def discard_stdout() -> None:
+                if process.stdout:
+                    while await process.stdout.read(65536):
+                        pass
+            # A large unread reply can pause the pipe and prevent wait() reaching EOF.
+            drain_task = asyncio.create_task(discard_stdout())
+            try:
+                if os.name == "nt":
+                    if process.returncode is None:
+                        process.terminate()  # Closing the owner kills its entire Job.
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                if os.name == "nt" and process.returncode is None:
                     process.kill()
-                    await process.wait()
+            finally:
+                if os.name != "nt":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=3)
+            finally:
+                try:
+                    await asyncio.wait_for(drain_task, timeout=2)
+                except (asyncio.TimeoutError, RuntimeError):
+                    drain_task.cancel()
+                    await asyncio.gather(drain_task, return_exceptions=True)
         if self._stderr_task:
             self._stderr_task.cancel()
             try:
@@ -726,7 +798,10 @@ class MCPServerProvider(ToolProvider):
     ) -> str:
         if not self.owns(tool_name):
             return ToolResult.failure(f"Unknown MCP tool: {tool_name}").to_json()
-        await self._ensure_connected()
+        if self.config.get("requires_network", False):
+            allowed, reason = context.network_allowed(tool_name)
+            if not allowed:
+                return ToolResult.failure(reason or "Network disabled", blocked=True).to_json()
         risk = self.assess_risk(tool_name, args, context)
         if context.approval_mode == "never" and risk.requires_approval:
             return ToolResult.failure(
@@ -741,6 +816,13 @@ class MCPServerProvider(ToolProvider):
                 approval_required=True,
                 risk=risk.level.value,
             ).to_json()
+        # Check authorization before reconnecting or starting any remote operation.
+        try:
+            await self._ensure_connected()
+        except Exception as exc:
+            return ToolResult.failure(f"MCP reconnect failed: {exc}", server=self.name).to_json()
+        if not self.owns(tool_name):
+            return ToolResult.failure(f"MCP tool no longer available: {tool_name}").to_json()
         if tool_name == _mcp_tool_name(self.namespace, "list_resources"):
             return ToolResult.success(json.dumps(self._resources, ensure_ascii=False), server=self.name).to_json()
         if tool_name == _mcp_tool_name(self.namespace, "read_resource"):
@@ -801,6 +883,7 @@ class MCPServerProvider(ToolProvider):
 
     async def _load_tools(self) -> None:
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         tools: list[dict[str, Any]] = []
         while True:
             params = {"cursor": cursor} if cursor else {}
@@ -809,10 +892,17 @@ class MCPServerProvider(ToolProvider):
             cursor = result.get("nextCursor")
             if not cursor:
                 break
+            if not isinstance(cursor, str) or cursor in seen_cursors or len(seen_cursors) >= 100:
+                raise RuntimeError("Invalid or excessive MCP tools/list pagination")
+            seen_cursors.add(cursor)
         self._tools = {}
         for tool in tools:
+            if not isinstance(tool, dict):
+                continue
             original = str(tool.get("name") or "")
             if not original:
+                continue
+            if self.allowed_tools is not None and original not in self.allowed_tools:
                 continue
             exposed = _mcp_tool_name(self.namespace, original)
             if exposed in self._tools:
@@ -821,13 +911,13 @@ class MCPServerProvider(ToolProvider):
             self._tools[exposed] = dict(tool)
 
     async def _load_optional_capabilities(self) -> None:
-        if "resources" in self._capabilities:
+        if "resources" in self._capabilities and self.config.get("include_resources", True):
             try:
                 await self._load_resources()
             except Exception:
                 self._resources = []
                 self._resource_templates = []
-        if "prompts" in self._capabilities:
+        if "prompts" in self._capabilities and self.config.get("include_prompts", True):
             try:
                 await self._load_prompts()
             except Exception:
@@ -868,13 +958,21 @@ class MCPServerProvider(ToolProvider):
         await self.start()
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        async with self._request_lock:
+            # One deadline for the entire exchange, not a fresh timeout per notification.
+            try:
+                return await asyncio.wait_for(self._exchange(method, params), timeout=self.timeout)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(f"MCP {method} timed out after {self.timeout:g}s; remote work may still be running") from exc
+
+    async def _exchange(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         if not self.process or not self.process.stdin or not self.process.stdout:
             raise RuntimeError(f"MCP server '{self.name}' is not connected")
         request_id = self._next_id
         self._next_id += 1
         await self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
         while True:
-            line = await asyncio.wait_for(self.process.stdout.readline(), timeout=self.timeout)
+            line = await self.process.stdout.readline()
             if not line:
                 code = await self.process.wait()
                 stderr = " | ".join(self._stderr_lines[-3:])
@@ -882,6 +980,14 @@ class MCPServerProvider(ToolProvider):
             try:
                 payload = json.loads(line.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if "method" in payload:
+                if "id" in payload:
+                    await self._write({"jsonrpc": "2.0", "id": payload["id"], "error": {
+                        "code": -32601, "message": "Client does not support server requests",
+                    }})
                 continue
             if payload.get("id") != request_id:
                 continue
@@ -905,11 +1011,19 @@ class MCPServerProvider(ToolProvider):
     async def _drain_stderr(self) -> None:
         if not self.process or not self.process.stderr:
             return
+        stream = self.process.stderr
+        pending = ""
         while True:
-            line = await self.process.stderr.readline()
-            if not line:
+            chunk = await stream.read(4096)
+            if not chunk:
+                if pending:
+                    self._stderr_lines.append(pending[-2000:])
+                    self._stderr_lines = self._stderr_lines[-20:]
                 return
-            self._stderr_lines.append(line.decode("utf-8", errors="replace").rstrip())
+            pending += chunk.decode("utf-8", errors="replace")
+            lines = pending.split("\n")
+            pending = lines.pop()[-2000:]
+            self._stderr_lines.extend(line.rstrip()[-2000:] for line in lines)
             self._stderr_lines = self._stderr_lines[-20:]
 
 

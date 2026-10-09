@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Tighten release edge cases: reset authentication on same-ID Codex provider re-import, normalize native probe routing, require actual text/stream evidence in probes, and prevent Responses retries after tool/reasoning fragments while redacting stream errors.
+- Add centralized provider presets and native Anthropic Messages JSON/SSE transport, preserving Chat/Responses/Codex OAuth paths. Scope persisted provider history to matching model endpoints, isolate auxiliary credentials, make generation options configurable, and add `/providers` plus offline protocol/tool-loop regressions.
+- Document a pinned project-local installation of five official Codex skills and add shared Drudge execution notes for imported workflows, with offline activation/resume and host-permission regression tests. Skill resources remain locally installed rather than bundled in releases.
+- Add an automatic slash-command menu with Chinese descriptions, prefix filtering, arrow-key navigation, Tab/Enter fill-only confirmation and static subcommand completion. Help and completion share one command catalog; non-interactive terminals retain simple input.
+- Replace typed approval answers with an arrow-key menu: per-call/session/deny choices, default deny, scrollable details, Ctrl+C cancellation and paused status rendering. Session grants remain scoped to the same tool and risk level.
+- Add an opt-in JSReverser-MCP browser preset and local YAML setup/probe helper, reusing host approvals and both model APIs.
+- Bound large MCP messages, serialize stdio requests, enforce whole-request deadlines, and clean up owned process trees.
+- Add MCP tool allowlists, optional environment isolation and host network gating; existing generic MCP defaults remain compatible.
+- Document and avoid the tested upstream collector/second-browser issue in the default 26-tool preset; DOM inspection uses same-page script evaluation. Inline screenshot-to-model vision remains pending.
+
 ## 0.2.0b3 — Beta
 
 This entry summarizes cumulative Beta capabilities, including earlier Beta releases

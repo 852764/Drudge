@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
 from .llm import create_client
+from model_config import resolve_model_config
 
 
 ClientFactory = Callable[[dict[str, Any]], Any]
@@ -49,7 +50,7 @@ async def probe_provider(
     include_streaming: bool = True,
     client_factory: ClientFactory = create_client,
 ) -> ProviderProbeReport:
-    config = dict(model_config)
+    config = resolve_model_config(model_config)
     if model:
         config["name"] = model
     target_model = str(config.get("name") or "")
@@ -66,7 +67,9 @@ async def probe_provider(
     except Exception as error:
         report.models_error = _safe_error(error)
 
-    for api_type in ("chat", "responses"):
+    # Native credentials are never sprayed across unrelated protocol routes.
+    api_types = ("anthropic",) if config.get("api") == "anthropic" else ("chat", "responses")
+    for api_type in api_types:
         report.capabilities[f"{api_type}.basic"] = await _probe_call(
             config,
             api_type=api_type,
@@ -113,15 +116,23 @@ async def _probe_call(
         )
         text = client.extract_text(response) or ""
         tool_calls = client.extract_tool_calls(response)
-        supported = bool(tool_calls) if tools else True
+        text_received = isinstance(text, str) and bool(text.strip())
+        streamed = any(isinstance(delta, str) and bool(delta) for delta in deltas)
+        supported = bool(tool_calls) if tools else text_received and (not streaming or streamed)
+        if tools:
+            failure = "Provider accepted the tool schema but returned no tool call."
+        elif not text_received:
+            failure = "Provider returned no nonempty final text."
+        else:
+            failure = "Provider returned final text but no streaming text delta."
         return CapabilityResult(
             supported=supported,
             latency_ms=_elapsed_ms(started),
             response_model=str(response.get("model") or "") or None,
-            text_received=bool(text),
+            text_received=text_received,
             tool_call_received=bool(tool_calls),
-            streamed=bool(deltas),
-            error=None if supported else "Provider accepted the tool schema but returned no tool call.",
+            streamed=streamed,
+            error=None if supported else failure,
         )
     except Exception as error:
         message = _safe_error(error)
@@ -161,7 +172,9 @@ def format_probe_report(report: ProviderProbeReport) -> str:
 def _probe_config(model_config: dict[str, Any], *, api: str) -> dict[str, Any]:
     config = dict(model_config)
     config["api"] = api
-    config["temperature"] = 0
+    # Respect explicit null: reasoning-only models can reject temperature.
+    if config.get("temperature", 0) is not None:
+        config["temperature"] = 0
     config["max_tokens"] = min(int(config.get("max_tokens", 64)), 64)
     config["max_retries"] = 1
     config["aliases"] = {}

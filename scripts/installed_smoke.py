@@ -12,6 +12,9 @@ import tempfile
 import main
 import agent
 import tools
+import model_config
+import agent.anthropic_client as anthropic_module
+from agent.anthropic_client import AnthropicClient
 from agent.llm import LLMClient
 from config import ConfigManager
 
@@ -33,11 +36,25 @@ class OfflineClient(LLMClient):
             assert "installed fixture" in content
             if self.api == "chat":
                 return {"choices": [{"message": {"role": "assistant", "content": "verified"}, "finish_reason": "stop"}]}
+            if self.api == "anthropic":
+                return {"content": [{"type": "text", "text": "verified"}], "stop_reason": "end_turn"}
             return {"status": "completed", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "verified"}]}]}
+        if self.api == "anthropic":
+            return {"content": [{"type": "tool_use", "id": f"call-{self.calls}", "name": name, "input": arguments}], "stop_reason": "tool_use"}
         arguments = json.dumps(arguments)
         if self.api == "chat":
             return {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [{"id": f"call-{self.calls}", "type": "function", "function": {"name": name, "arguments": arguments}}]}, "finish_reason": "tool_calls"}]}
         return {"status": "completed", "output": [{"type": "function_call", "call_id": f"call-{self.calls}", "name": name, "arguments": arguments}]}
+
+
+class OfflineAnthropicClient(AnthropicClient):
+    def __init__(self):
+        super().__init__("https://example.invalid/v1", "offline", "offline", api_type="anthropic")
+        self.api = "anthropic"
+        self.calls = 0
+
+    async def _post_json(self, url, body):
+        return await OfflineClient._post_json(self, url, body)
 
 
 async def exercise(root):
@@ -51,9 +68,9 @@ async def exercise(root):
         config.override(section, key, value=value)
     config.override("toolsets", value=["file", "terminal"])
     (root / "sample.txt").write_text("installed fixture", encoding="utf-8")
-    for api in ("chat", "responses"):
+    for api in ("chat", "responses", "anthropic"):
         runtime = agent.Agent(config)
-        runtime.llm = OfflineClient(api)
+        runtime.llm = OfflineAnthropicClient() if api == "anthropic" else OfflineClient(api)
         assert await runtime.run("read fixture with a plan") == "verified"
         restored = agent.Agent(config)
         restored.resume_session(runtime.session_id)
@@ -68,9 +85,9 @@ async def exercise(root):
 
 
 if __name__ == "__main__":
-    for module in (main, agent, tools):
+    for module in (main, agent, tools, model_config, anthropic_module):
         assert Path(module.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()), module.__file__
     assert version("drudge") == main.VERSION
     with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
         asyncio.run(exercise(Path(directory).resolve()))
-    print("Installed wheel: imports, CLI version, both APIs, persistent plans and terminal passed (offline).")
+    print("Installed wheel: imports, CLI version, Chat/Responses/Anthropic APIs, persistent plans and terminal passed (offline).")

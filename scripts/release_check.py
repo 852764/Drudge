@@ -82,7 +82,7 @@ def check_archive(path: Path) -> dict:
                     raise ValueError(f"Wheel symlink: {info.filename}")
                 check_content(info.filename, archive.read(info))
                 names.append(info.filename)
-        required = {"main.py", "config.py", "agent/drudge_agent.py", "tools/_windows_job.py", "tools/plan.py"}
+        required = {"main.py", "config.py", "model_config.py", "agent/drudge_agent.py", "agent/anthropic_client.py", "tools/_windows_job.py", "tools/plan.py"}
         if not required.issubset(names):
             raise ValueError(f"Wheel missing required modules: {sorted(required - set(names))}")
     else:
